@@ -224,6 +224,6 @@ This question leads directly into the next experiment.
 
 ## Next Experiment
 
-**02 — Retries**
+**[02 — Retries](../02-Retries/)**
 
 The next lab explores what happens when a client retries a request after a timeout while the original request may still be executing.

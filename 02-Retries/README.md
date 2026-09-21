@@ -268,6 +268,6 @@ That question leads directly to **idempotency**.
 
 ## Next Experiment
 
-**03 — Idempotency**
+**[03 — Idempotency](../03-Idempotency/)**
 
 The next lab explores how to safely retry operations without creating duplicate side effects.
