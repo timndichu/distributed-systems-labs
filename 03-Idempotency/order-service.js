@@ -1,8 +1,11 @@
 const http = require("http");
 
-const server = http.createServer((req, res) => {
-  if (req.method === "POST" && req.url === "/orders") {
-    console.log("📦 Order received");
+const IDEMPOTENCY_KEY = "order-payment-123";
+
+function makePaymentRequest(attempt) {
+  return new Promise((resolve, reject) => {
+    console.log(`💳 Attempt ${attempt}: Sending payment request`);
+    console.log(`🔑 Idempotency-Key: ${IDEMPOTENCY_KEY}`);
 
     const paymentRequest = http.request(
       {
@@ -11,6 +14,10 @@ const server = http.createServer((req, res) => {
         path: "/payments",
         method: "POST",
         timeout: 2000,
+
+        headers: {
+          "Idempotency-Key": IDEMPOTENCY_KEY,
+        },
       },
       (paymentResponse) => {
         let body = "";
@@ -20,26 +27,62 @@ const server = http.createServer((req, res) => {
         });
 
         paymentResponse.on("end", () => {
-          console.log("💳 Payment response received");
-
-          res.writeHead(200, {
-            "Content-Type": "application/json",
-          });
-
-          res.end(
-            JSON.stringify({
-              orderCreated: true,
-              payment: JSON.parse(body),
-            })
-          );
+          resolve(JSON.parse(body));
         });
       }
     );
 
     paymentRequest.on("timeout", () => {
-      console.log("⏰ PAYMENT REQUEST TIMED OUT");
+      console.log(`⏰ Attempt ${attempt}: Request timed out`);
 
       paymentRequest.destroy();
+
+      reject(new Error("TIMEOUT"));
+    });
+
+    paymentRequest.on("error", (error) => {
+      reject(error);
+    });
+
+    paymentRequest.end();
+  });
+}
+
+async function processPayment() {
+  try {
+    return await makePaymentRequest(1);
+  } catch (error) {
+    if (error.message !== "TIMEOUT") {
+      throw error;
+    }
+
+    console.log("🔄 Retrying payment...\n");
+
+    return await makePaymentRequest(2);
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === "POST" && req.url === "/orders") {
+    console.log("\n📦 Order received");
+
+    try {
+      const payment = await processPayment();
+
+      console.log("✅ Payment completed successfully");
+
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+      });
+
+      res.end(
+        JSON.stringify({
+          orderCreated: true,
+          payment,
+        })
+      );
+    } catch (error) {
+      console.log("❌ Payment failed:", error.message);
 
       res.writeHead(504, {
         "Content-Type": "application/json",
@@ -47,17 +90,11 @@ const server = http.createServer((req, res) => {
 
       res.end(
         JSON.stringify({
-          success: false,
-          message: "Payment service timed out",
+          orderCreated: false,
+          message: "Payment service unavailable",
         })
       );
-    });
-
-    paymentRequest.on("error", (error) => {
-      console.log("❌ Payment request error:", error.message);
-    });
-
-    paymentRequest.end();
+    }
 
     return;
   }
