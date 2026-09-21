@@ -18,16 +18,10 @@ const request = http.request(
       console.log("\n📨 Response from Order Service:");
       console.log(body);
     });
-  },
+  }
 );
 
 request.on("error", (error) => {
-  if (error.code === "ECONNREFUSED") {
-    return console.log(
-      "❌ Request failed: Connection refused. Is the Order Service running?",
-    );
-  }
-
   console.log("❌ Request failed:", error.message);
 });
 
