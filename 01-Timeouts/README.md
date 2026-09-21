@@ -4,302 +4,226 @@
 A timeout is a mechanism that allows a system to specify a maximum amount of time to wait for an operation to complete. If the operation does not complete within the specified time, the system will terminate the operation and return an error or take alternative action.
 
 
-## Overview
+# 01 — Timeouts
 
-This experiment demonstrates how a timeout behaves in a distributed system when a downstream service takes longer to respond than the caller is willing to wait.
+This experiment demonstrates how a timeout behaves when one service depends on a slow downstream service.
 
-The key idea is:
-
-> A timeout means the caller has stopped waiting. It does not necessarily mean the downstream operation stopped executing.
-
----
-
-## Architecture
-
-The experiment consists of three components:
-
-```text
-┌──────────────┐
-│    Client    │
-└──────┬───────┘
-       │
-       │ POST /orders
-       ▼
-┌──────────────────┐
-│  Order Service   │
-│                  │
-│ Timeout: 2 sec   │
-└────────┬─────────┘
-         │
-         │ POST /payments
-         ▼
-┌──────────────────┐
-│ Payment Service  │
-│                  │
-│ Processing: 5s   │
-└──────────────────┘
-```
-
-### Services
-
-| Service         |   Port | Purpose                            |
-| --------------- | -----: | ---------------------------------- |
-| Client          |      — | Initiates an order                 |
-| Order Service   | `3000` | Calls the Payment Service          |
-| Payment Service | `3001` | Simulates a slow payment operation |
+The focus is not simply on implementing a timeout, but on understanding what a timeout actually means in a distributed system.
 
 ---
 
 ## Scenario
 
-The Order Service sends a payment request to the Payment Service.
-
-The Payment Service intentionally takes **5 seconds** to process the request.
-
-The Order Service has a **2-second timeout**.
-
-Therefore:
+The system contains three components:
 
 ```text
-Payment processing time = 5 seconds
-Order Service timeout   = 2 seconds
+Client
+  │
+  ▼
+Order Service
+  │
+  ▼
+Payment Service
 ```
 
-The Order Service will stop waiting after 2 seconds.
+The `Payment Service` intentionally takes **5 seconds** to respond.
+
+The `Order Service` has a **2-second timeout** when calling the payment service.
+
+---
+
+## Expected Behavior
+
+The request flow is:
+
+```text
+Client
+  │
+  │ POST /orders
+  ▼
+Order Service
+  │
+  │ POST /payments
+  │
+  │ timeout = 2s
+  ▼
+Payment Service
+  │
+  │ processing...
+  │
+  │ 5 seconds
+  │
+  X
+```
+
+After approximately two seconds, the order service gives up waiting for the payment service.
+
+The client therefore receives a failure response instead of waiting the full five seconds.
+
+---
+
+## The Important Observation
+
+A timeout does **not necessarily cancel the downstream operation**.
+
+This is the key behavior demonstrated by the experiment.
+
+```text
+Order Service
+      │
+      │ request
+      ▼
+Payment Service
+      │
+      │ still processing
+      │
+      │
+      X Order Service times out
+      │
+      ▼
+Client receives 504
+
+Payment Service may still finish
+the original operation.
+```
+
+This creates an important distributed-systems problem:
+
+> The caller has stopped waiting, but the operation may still be executing.
+
+---
+
+## Why This Matters
+
+Consider a real payment request.
+
+The client sends:
+
+```text
+Pay KES 10,000
+```
+
+The payment service receives the request and starts processing it.
+
+The caller times out.
+
+From the caller's perspective:
+
+```text
+"Payment failed."
+```
+
+But from the payment service's perspective:
+
+```text
+"Payment is still processing."
+```
+
+The two systems now have different views of the operation.
+
+This is one of the reasons timeout handling cannot be treated as simply:
+
+```text
+timeout = failure
+```
 
 ---
 
 ## Running the Experiment
 
-### 1. Start the Payment Service
+Install dependencies:
+
+```bash
+npm install
+```
+
+Start the payment service:
 
 ```bash
 node payment-service.js
 ```
 
-Expected output:
-
-```text
-💰 Payment Service running on port 3001
-```
-
-### 2. Start the Order Service
-
-In another terminal:
+Start the order service:
 
 ```bash
 node order-service.js
 ```
 
-Expected output:
-
-```text
-📦 Order Service running on port 3000
-```
-
-### 3. Send an order
-
-In a third terminal:
+Then run the client:
 
 ```bash
 node client.js
 ```
 
----
-
-## Expected Behaviour
-
-### Order Service
-
-The Order Service receives the request and sends a payment request downstream:
-
-```text
-📦 Order received
-⏰ PAYMENT REQUEST TIMED OUT
-```
-
-The timeout occurs after approximately 2 seconds.
-
-The client receives:
-
-```json
-{
-  "success": false,
-  "message": "Payment service timed out"
-}
-```
-
-### Payment Service
-
-However, the Payment Service continues processing the request:
-
-```text
-💰 Payment request received
-⏳ Processing payment...
-```
-
-After approximately 5 seconds:
-
-```text
-✅ Payment processed
-```
-
-This demonstrates that the timeout at the caller does not necessarily stop the work being performed by the downstream service.
+The order service should time out while the payment service continues processing.
 
 ---
 
-## Timeline
+## Architecture
 
 ```text
-Time
- │
-0s ── Client sends order
- │
- ├──── Order Service sends payment request
- │
- ├──── Payment Service starts processing
- │
- │
-2s ── Order Service timeout
- │
- ├──── Order Service stops waiting
- │
- └──── Client receives 504 response
- │
- │
- │    Payment Service is still processing
- │
- │
-5s ── Payment Service completes payment
- │
- ▼
+┌──────────┐
+│  Client  │
+└────┬─────┘
+     │
+     │ HTTP
+     ▼
+┌───────────────┐
+│ Order Service │
+│               │
+│ timeout: 2s   │
+└───────┬───────┘
+        │
+        │ HTTP
+        ▼
+┌──────────────────┐
+│ Payment Service  │
+│                  │
+│ processing: 5s   │
+└──────────────────┘
 ```
-
----
-
-## Important Observation
-
-The system can reach an ambiguous state:
-
-```text
-                 Did the payment succeed?
-                          ?
-                         / \
-                       YES  NO
-```
-
-The Order Service knows only that it **did not receive a response within its timeout window**.
-
-It does not necessarily know whether:
-
-* the Payment Service never received the request;
-* the Payment Service received the request but has not finished;
-* the Payment Service completed the operation but the response was delayed;
-* the Payment Service completed the operation but the response was lost.
-
-Therefore:
-
-> A timeout should not automatically be interpreted as a failed operation.
-
----
-
-## Why Timeouts Matter
-
-Without timeouts, a service could wait indefinitely for a dependency:
-
-```text
-Request 1 → waiting...
-Request 2 → waiting...
-Request 3 → waiting...
-Request 4 → waiting...
-...
-Request N → waiting...
-```
-
-As more requests become blocked, the service can consume resources such as:
-
-* threads
-* connections
-* memory
-* connection-pool slots
-
-Eventually, the calling service can become unhealthy even though the original problem occurred in a downstream dependency.
-
-Timeouts establish a boundary on how long a caller is willing to wait.
-
----
-
-## What This Experiment Does Not Solve
-
-This experiment intentionally leaves an important problem unresolved.
-
-If the Order Service times out and the client tries the operation again, the original request may already have been processed.
-
-For example:
-
-```text
-Request #1
-    │
-    ▼
-Payment Service
-    │
-    ├── Payment succeeds
-    │
-    └── Response not received by caller
-
-Caller times out
-
-Request #2
-    │
-    ▼
-Payment Service
-    │
-    └── Payment succeeds again
-```
-
-This can result in duplicate processing.
-
-Handling this scenario requires additional mechanisms such as:
-
-* retries
-* idempotency
-* request identifiers
-* deduplication
-
-These topics are explored in subsequent labs.
 
 ---
 
 ## Key Takeaways
 
-1. **A timeout limits how long a caller waits for a response.**
+### 1. Timeouts protect the caller
 
-2. **A timeout does not necessarily cancel the downstream operation.**
+Without a timeout, a slow dependency can cause the caller to wait indefinitely.
 
-3. **The caller may not know whether the operation actually succeeded.**
+### 2. Timeouts do not guarantee cancellation
 
-4. **Timeouts protect services from waiting indefinitely on slow dependencies.**
+The downstream service may continue processing after the caller stops waiting.
 
-5. **Timeouts can create ambiguous outcomes that require careful handling when retries are introduced.**
+### 3. Timeout does not always mean failure
+
+The caller often cannot immediately determine whether the operation:
+
+* never started,
+* is still running,
+* completed successfully,
+* or completed unsuccessfully.
+
+### 4. Timeouts create the conditions for retries
+
+Once a request times out, a common next step is to retry it.
+
+That introduces another problem:
+
+```text
+Timeout
+   ↓
+Retry
+   ↓
+Could the original request still be running?
+```
+
+This question leads directly into the next experiment.
 
 ---
 
-## Experiment Summary
+## Next Experiment
 
-```text
-Downstream processing time: 5 seconds
-Caller timeout:             2 seconds
+**02 — Retries**
 
-Result:
-
-Caller:
-    TIMEOUT ❌
-
-Downstream:
-    OPERATION COMPLETED ✅
-
-System state:
-    OUTCOME UNKNOWN TO CALLER ⚠️
-```
-
-This ambiguity is one of the fundamental challenges of building reliable distributed systems.
+The next lab explores what happens when a client retries a request after a timeout while the original request may still be executing.

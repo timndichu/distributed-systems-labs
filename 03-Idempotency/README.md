@@ -1,547 +1,207 @@
 # 03 — Idempotency
 
-## Overview
+This experiment explores how to safely process retried operations without creating duplicate side effects.
 
-This lab demonstrates how **idempotency** prevents duplicate processing when a request is retried.
+The lab progressively evolves a payment-processing system from a naive implementation into a design that can:
 
-The scenario is based on a payment service where:
-
-1. A client sends a payment request.
-2. The payment service takes several seconds to process it.
-3. The caller has a shorter timeout.
-4. The caller times out and retries the request.
-5. Both requests contain the same `Idempotency-Key`.
-
-The goal is to understand why retries can cause duplicate side effects and how idempotency can prevent them.
+* prevent duplicate processing,
+* coordinate multiple service instances,
+* survive service crashes,
+* handle ambiguous outcomes,
+* and reconcile local state with an external payment provider.
 
 ---
 
-## Architecture
+# Problem
+
+Consider a payment request:
 
 ```text
-Client
-
-   │
-
-   │ POST /orders
-
-   ▼
-
-┌──────────────────┐
-│  Order Service   │
-│      :3000       │
-└────────┬─────────┘
-         │
-         │ POST /payments
-         │ Idempotency-Key: order-payment-123
-         ▼
-┌──────────────────┐
-│ Payment Service  │
-│      :3001       │
-└──────────────────┘
+POST /payments
+Idempotency-Key: order-payment-123
 ```
 
-The Order Service has a **2-second timeout**.
+The client sends the request.
 
-The Payment Service takes **5 seconds** to process a payment.
+The payment service begins processing.
 
-This creates the possibility that the caller will retry while the original payment is still being processed.
+The caller times out.
+
+The client retries the same request.
+
+The original request may still be running.
+
+Without protection:
+
+```text
+Request #1
+    ↓
+Payment succeeds
+
+Request #2
+    ↓
+Payment succeeds again
+```
+
+One logical operation can therefore produce multiple physical side effects.
 
 ---
 
 # Experiment 1 — Naive Idempotency
 
-The first implementation stored the payment result using the idempotency key:
+The first implementation uses an in-memory `Map`:
 
 ```js
-processedPayments.set(idempotencyKey, paymentResult);
+const processedPayments = new Map();
 ```
 
-When a request arrived, the service checked:
+The service checks whether an idempotency key has already been processed.
 
-```js
-if (processedPayments.has(idempotencyKey)) {
-    // Return previous result
-}
+If the key exists, the stored result is returned.
+
+Otherwise, the payment is processed.
+
+Conceptually:
+
+```text
+Request
+  │
+  ▼
+Does key exist?
+  │
+  ├── YES → return previous result
+  │
+  └── NO  → process payment
 ```
 
 This looks correct at first.
 
-However, the result was only stored **after processing finished**.
-
-That created a race condition.
+However, there is a race condition.
 
 ---
 
-## Running the Experiment
+# Experiment 2 — Race Condition
 
-Start the Payment Service:
+The initial implementation stores the idempotency key only **after** processing completes.
 
-```bash
-node payment-service.js
-```
-
-Start the Order Service in another terminal:
-
-```bash
-node order-service.js
-```
-
-Then run the client:
-
-```bash
-node client.js
-```
-
----
-
-## Observed Result
-
-The Payment Service produced:
-
-```text
-💰 Payment request received
-
-🔑 Idempotency-Key: order-payment-123
-
-🆕 New payment request
-
-⏳ Processing payment...
-
-💰 Payment request received
-
-🔑 Idempotency-Key: order-payment-123
-
-🆕 New payment request
-
-⏳ Processing payment...
-
-✅ Payment processed
-
-💾 Result stored against idempotency key
-
-✅ Payment processed
-
-💾 Result stored against idempotency key
-```
-
-Two requests were processed even though they used the **same idempotency key**.
-
-The service generated two different payment IDs:
-
-```text
-payment-1789995813485
-payment-1789995815488
-```
-
-This proves that the payment was processed twice.
-
----
-
-# Why Did This Happen?
-
-The problem was the timing.
-
-```text
-Time
-
-0s ── Request #1 arrives
- │
- │    Key does not exist
- │    Start processing
- │
-2s ── Request #1 times out
- │
- │    Retry starts
- │
- │    Request #2 arrives
- │    Key still does not exist
- │
- │    Start processing AGAIN
- │
-5s ── Request #1 finishes
- │    Store idempotency key
- │
-7s ── Request #2 finishes
-      Store idempotency key again
-```
-
-The important detail is that the idempotency key wasn't recorded when processing **started**.
-
-It was only recorded when processing **finished**.
-
-Therefore, while the first request was still processing:
-
-```js
-processedPayments.has("order-payment-123")
-```
-
-returned:
-
-```text
-false
-```
-
-for the retry.
-
-The retry therefore looked like a completely new operation.
-
----
-
-# The Race Condition
-
-The problem can be visualized as:
-
-```text
-                 Request #1
-                      │
-                      ▼
-              Key doesn't exist
-                      │
-                      ▼
-               Start processing
-                      │
-                      │
-                      │
-                      │       Request #2
-                      │            │
-                      │            ▼
-                      │     Key doesn't exist
-                      │            │
-                      │            ▼
-                      │     Start processing
-                      │
-                      ▼
-                 Payment #1
-                      │
-                      ▼
-                Store result
-                      │
-                      ▼
-                 Payment #2
-                      │
-                      ▼
-                Store result
-```
-
-Both requests passed the idempotency check before either one stored the completed result.
-
----
-
-# Important Lesson
-
-An idempotency implementation cannot simply ask:
-
-> "Have I already completed this operation?"
-
-It also needs to know:
-
-> "Is this operation already being processed?"
-
-This means the idempotency record needs a state.
-
-For example:
-
-```text
-NEW
- │
- ▼
-PROCESSING
- │
- ▼
-COMPLETED
-```
-
----
-
-# Experiment 2 — Fixing the Race Condition
-
-The implementation was changed so that the idempotency key is **reserved before payment processing begins**.
-
-The service now stores:
-
-```js
-payments.set(idempotencyKey, {
-    status: "PROCESSING",
-});
-```
-
-before starting the payment operation.
-
-The lifecycle is now:
+The timeline becomes:
 
 ```text
 Request #1
-    │
-    ▼
-Idempotency key does not exist
-    │
-    ▼
-Create PROCESSING record
-    │
-    ▼
-Process payment
-    │
-    ▼
-Mark COMPLETED
+   │
+   ├── key does not exist
+   │
+   ├── start processing
+   │
+   │
+Request #2
+   │
+   ├── key does not exist
+   │
+   └── start processing
 ```
 
-If another request arrives while the first request is processing:
+Both requests can therefore enter the payment-processing section before either request records the key.
+
+Result:
 
 ```text
-Request #2
-    │
-    ▼
-Idempotency key exists
-    │
-    ▼
-Status = PROCESSING
-    │
-    ▼
-Do NOT process payment again
+Request #1 → Payment A
+Request #2 → Payment B
 ```
+
+The idempotency check exists, but it is not sufficient.
 
 ---
 
-## Observed Result After the Fix
+# Experiment 3 — Reserve Before Processing
 
-The Payment Service produced:
+The next implementation reserves the key immediately.
 
-```text
-💰 Payment request received
-
-🔑 Idempotency-Key: order-payment-123
-
-🆕 New payment request
-
-🔒 Idempotency key reserved
-
-📊 Status: PROCESSING
-
-⏳ Processing payment...
-
-💰 Payment request received
-
-🔑 Idempotency-Key: order-payment-123
-
-♻️ Existing idempotency record found
-
-📊 Status: PROCESSING
-
-⏳ Payment is already being processed
-
-🚫 NOT starting another payment
-
-✅ Payment processed
-
-💾 Result stored
-
-📊 Status: COMPLETED
+```js
+payments.set(idempotencyKey, {
+  status: "PROCESSING",
+});
 ```
 
-The key observation is that there is now only **one payment processing operation**.
-
-The retry detects:
+The state machine becomes:
 
 ```text
-Status: PROCESSING
+             ┌──────────────┐
+             │              │
+             ▼              │
+        PROCESSING          │
+             │              │
+             ▼              │
+         COMPLETED          │
+```
+
+A second request now sees:
+
+```text
+PROCESSING
 ```
 
 and does not start another payment.
 
----
-
-# Experiment 3 — Retry After Completion
-
-The next scenario tests what happens when the same request is retried **after the original operation has completed**.
-
-The expected lifecycle is:
+The flow becomes:
 
 ```text
-PROCESSING
-     │
-     ▼
-COMPLETED
-     │
-     │
-     │ retry
-     ▼
-Return stored result
+Request #1
+    │
+    ├── reserve key
+    │
+    └── PROCESSING
+          │
+          ▼
+       payment
+
+
+Request #2
+    │
+    └── sees PROCESSING
+            │
+            └── do not process again
 ```
 
-After the first payment completed, another request was sent using the same:
+This solves the race condition within a single process.
 
-```text
-Idempotency-Key: order-payment-123
-```
-
-The service detected the existing completed operation and returned the previously stored result instead of processing another payment.
-
-Expected behavior:
-
-```text
-💰 Payment request received
-
-🔑 Idempotency-Key: order-payment-123
-
-♻️ Existing idempotency record found
-
-📊 Status: COMPLETED
-
-✅ Payment already completed
-
-📦 Returning stored result
-```
-
-No new payment should be created.
+But another problem remains.
 
 ---
 
-# Correct Idempotency Model
+# The Shared-State Problem
 
-The complete behavior is now:
+An in-memory `Map` only exists inside one process.
 
-```text
-                    Request
-                       │
-                       ▼
-              Does key exist?
-                 /          \
-               No            Yes
-               │              │
-               ▼              ▼
-          PROCESSING      Check status
-               │          /          \
-               │         /            \
-               │    PROCESSING       COMPLETED
-               │         │               │
-               │         ▼               ▼
-               │   Don't duplicate   Return result
-               │
-               ▼
-          Process payment
-               │
-               ▼
-           COMPLETED
-               │
-               ▼
-          Store result
-```
-
----
-
-# Why This Matters in Distributed Systems
-
-The problem becomes even more important when a service has multiple instances.
-
-For example:
+Consider:
 
 ```text
-               ┌───────────────┐
-               │ Load Balancer │
-               └───────┬───────┘
-                       │
-            ┌──────────┴──────────┐
-            ▼                     ▼
-     Payment Service 1     Payment Service 2
-            │                     │
-            └──────────┬──────────┘
-                       ▼
-                  Shared DB
+                 ┌────────────────────┐
+                 │      Database      │
+                 └────────────────────┘
+                       ▲        ▲
+                       │        │
+                       │        │
+              ┌────────┘        └─────────┐
+              │                           │
+      ┌───────────────┐           ┌───────────────┐
+      │ Payment       │           │ Payment       │
+      │ Service #1    │           │ Service #2    │
+      └───────────────┘           └───────────────┘
 ```
 
-An in-memory `Map` is not sufficient here.
+If each instance maintains its own `Map`, both instances can believe that a key is new.
 
-Each application instance would have its own memory:
-
-```text
-Payment Service 1
-
-Map(...)
-
-      ≠
-
-Payment Service 2
-
-Map(...)
-```
-
-Both instances could therefore believe:
-
-```text
-"This idempotency key doesn't exist."
-```
-
-A production implementation normally uses a shared persistent store such as a database or Redis, together with an atomic operation or unique constraint.
-
-For example:
-
-```text
-idempotency_key UNIQUE
-
-status
-
-result
-```
-
-The uniqueness constraint ensures that only one request can successfully create the idempotency record.
+For distributed coordination, the idempotency state needs to be shared.
 
 ---
 
 # Experiment 4 — Database-Backed Idempotency
 
-The in-memory solution works within a single Node.js process, but it has an important limitation.
+PostgreSQL is introduced as the shared source of truth.
 
-Imagine we have two payment service instances:
-
-```text
-                 ┌──────────────────────┐
-                 │       Client         │
-                 └──────────┬───────────┘
-                            │
-                 ┌──────────┴───────────┐
-                 │                      │
-                 ▼                      ▼
-       Payment Service 1      Payment Service 2
-            :3001                   :3002
-                 │                      │
-                 └──────────┬───────────┘
-                            │
-                            ▼
-                     PostgreSQL
-```
-
-Each process has its own memory.
-
-Therefore:
-
-```text
-Service 1
-    |
-    v
-Map A
-
-Service 2
-    |
-    v
-Map B
-```
-
-Service 1 cannot see Service 2's `Map`.
-
-We therefore need **shared state**.
-
----
-
-## Database Schema
-
-We created a PostgreSQL database:
-
-```text
-idempotency_lab
-```
-
-with the following table:
+The table:
 
 ```sql
 CREATE TABLE idempotency_keys (
@@ -554,19 +214,19 @@ CREATE TABLE idempotency_keys (
 );
 ```
 
-The important part is:
+The important constraint is:
 
 ```sql
-idempotency_key VARCHAR(255) NOT NULL UNIQUE
+UNIQUE (idempotency_key)
 ```
 
-This means PostgreSQL guarantees that two rows cannot have the same idempotency key.
+This allows the database itself to enforce uniqueness.
 
 ---
 
-## Atomic Claim
+# Atomic Claim
 
-The payment service attempts to claim the idempotency key using:
+The service attempts to claim an idempotency key using:
 
 ```sql
 INSERT INTO idempotency_keys (
@@ -578,348 +238,244 @@ ON CONFLICT (idempotency_key) DO NOTHING
 RETURNING *;
 ```
 
-This is important because the operation is atomic.
+The result determines ownership.
 
-If the insert succeeds:
+### Insert succeeds
 
-```text
-rowCount === 1
-```
-
-This service successfully claimed the operation.
-
-It can process the payment.
-
-If the insert does not insert anything:
+The service successfully claimed the operation.
 
 ```text
-rowCount === 0
-```
-
-the key already exists.
-
-The service then checks the existing record.
-
----
-
-## Why Not SELECT Then INSERT?
-
-A tempting implementation would be:
-
-```text
-SELECT
-  ↓
-Does key exist?
-  ↓
-No
-  ↓
 INSERT
+  ↓
+row returned
+  ↓
+PROCESSING
+  ↓
+process payment
 ```
 
-But two service instances could do this simultaneously:
+### Insert does not return a row
+
+Another request already owns the key.
+
+The service reads the existing state.
 
 ```text
-Service 1                 Service 2
-    |                         |
-    |------ SELECT ---------->|
-    |                         |
-    |<----- not found --------|
-    |                         |
-    |                      SELECT
-    |                         |
-    |                      not found
-    |                         |
-    |------ INSERT ---------->|
-    |                     INSERT
+INSERT
+  ↓
+conflict
+  ↓
+read existing record
 ```
 
-Both services could believe they were allowed to process the payment.
-
-Instead, we let PostgreSQL perform the uniqueness check atomically:
+Possible states:
 
 ```text
-Service 1 ─────┐
-               │
-               ▼
-           PostgreSQL
-           UNIQUE KEY
-               ▲
-               │
-Service 2 ─────┘
-```
-
-Only one instance can successfully claim the key.
-
----
-
-## Two-Instance Experiment
-
-We started two copies of the payment service:
-
-```text
-Payment Service 1 → localhost:3001
-
-Payment Service 2 → localhost:3002
-```
-
-Both received:
-
-```text
-Idempotency-Key: order-payment-123
-```
-
-The client intentionally sent both requests at almost the same time.
-
-### One instance successfully claimed the key
-
-```text
-💰 payment-service-1
-
-🔑 Idempotency-Key: order-payment-123
-
-🔒 Idempotency key successfully claimed
-
-📊 Status: PROCESSING
-
-⏳ Processing payment...
-```
-
-### The second instance detected the existing operation
-
-```text
-💰 payment-service-2
-
-🔑 Idempotency-Key: order-payment-123
-
-♻️ Idempotency key already exists
-
-📊 Existing status: PROCESSING
-
-🚫 Payment already being processed
-```
-
-After processing completed:
-
-```text
-✅ Payment processed
-
-💾 Result stored in database
-
-📊 Status: COMPLETED
+PROCESSING
+COMPLETED
 ```
 
 ---
 
-## Database Verification
+# Why Not SELECT Then INSERT?
 
-We verified the result directly in PostgreSQL:
+A tempting implementation is:
 
 ```sql
-SELECT
-    id,
-    idempotency_key,
-    status,
-    result,
-    created_at,
-    updated_at
-FROM idempotency_keys;
+SELECT *
+FROM idempotency_keys
+WHERE idempotency_key = $1;
 ```
 
-The database contained **one record** for:
+Then:
 
 ```text
-order-payment-123
+if not found:
+    INSERT
 ```
 
-with:
+But two instances can execute the SELECT at the same time:
 
 ```text
-status = COMPLETED
+Instance A                 Instance B
+
+SELECT → not found         SELECT → not found
+     │                           │
+     ▼                           ▼
+INSERT                      INSERT
 ```
 
-This proves that two independent service instances did not create two payment operations.
+Both instances believe they can proceed.
+
+The atomic `INSERT ... ON CONFLICT` approach moves the ownership decision into one database operation.
 
 ---
 
-# The Evolution of the Solution
+# Multiple Service Instances
 
-The lab progressed through three increasingly robust approaches:
-
-### 1. Naive
+The experiment runs two payment-service instances:
 
 ```text
-Check → Process → Store
+Payment Service #1 → :3001
+Payment Service #2 → :3002
 ```
 
-Problem:
+Both share the same PostgreSQL database.
+
+The same idempotency key is sent to both instances concurrently.
+
+Expected behavior:
 
 ```text
-Race condition
+                 ┌───────────────┐
+                 │  PostgreSQL   │
+                 └───────┬───────┘
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+              ▼                     ▼
+        Service #1             Service #2
+              │                     │
+              │ claim key           │
+              │                     │
+              ▼                     │
+         PROCESSING                 │
+                                    │
+                             conflict detected
+                                    │
+                                    ▼
+                              read PROCESSING
 ```
 
----
-
-### 2. In-memory reservation
-
-```text
-Check → Reserve → Process → Complete
-```
-
-Problem:
-
-```text
-State exists only inside one process
-```
-
-Multiple service instances cannot share it.
-
----
-
-### 3. Database-backed reservation
-
-```text
-Atomic INSERT
-      ↓
-   PROCESSING
-      ↓
-   Process
-      ↓
-   COMPLETED
-      ↓
- Store result
-```
-
-The database becomes the shared source of truth.
-
-```text
-              PostgreSQL
-                  │
-        ┌─────────┴─────────┐
-        │                   │
-        ▼                   ▼
-   Service 1           Service 2
-```
-
-This allows independent service instances to coordinate.
+Only one instance processes the payment.
 
 ---
 
 # Experiment 5 — Ambiguous Outcome
 
-The database-backed implementation solves duplicate claims, but another problem remains.
+The database-backed design prevents duplicate processing while the operation is known to be in progress.
 
-Consider this sequence:
+But there is a more difficult failure scenario.
+
+Consider:
 
 ```text
 INSERT idempotency key
         ↓
-     PROCESSING
+PROCESSING
         ↓
-Call payment provider
+Call external payment provider
         ↓
 Payment succeeds
         ↓
-💥 Service crashes
+Service crashes
         ↓
-UPDATE idempotency key to COMPLETED
-never happens
+UPDATE idempotency_keys → COMPLETED
+        ↓
+NEVER EXECUTES
 ```
 
-After the service crashes, our database still says:
+The database now says:
 
 ```text
 PROCESSING
 ```
 
-But the external payment provider may already have successfully processed the payment.
-
-This creates an **ambiguous outcome**.
-
-Our service knows:
+But the external payment provider may say:
 
 ```text
-"The operation was started."
+PAYMENT SUCCESSFUL
 ```
 
-but it does not know whether the external side effect completed before the crash.
+The local system does not know the final outcome.
+
+This is an **ambiguous outcome**.
 
 ---
 
-## Why This Is Dangerous
+# Why This Is Dangerous
 
-Suppose the service simply retries the payment:
+Suppose the client retries.
 
-```text
-PROCESSING
-    ↓
-Retry payment
-    ↓
-Payment provider
-    ↓
-💰 Payment succeeds AGAIN
-```
-
-We could charge the customer twice.
-
-But if we refuse to retry forever:
+The local database says:
 
 ```text
 PROCESSING
-    ↓
-Do nothing
 ```
 
-the customer may have already paid while our system never records the successful result.
+A naive implementation might simply process the payment again.
 
-We therefore need a way to determine what actually happened.
+That could produce:
+
+```text
+Original request → Payment A
+Retry            → Payment B
+```
+
+The customer is charged twice.
+
+But refusing to do anything creates another problem:
+
+```text
+PROCESSING
+```
+
+could remain forever even though the payment actually succeeded.
+
+The system needs a way to determine what happened externally.
 
 ---
 
 # Experiment 6 — Recovery and Reconciliation
 
-To demonstrate this, the lab introduced a mock payment provider.
+A mock external payment provider is introduced.
 
-The architecture becomes:
+The provider exposes:
 
 ```text
-                       Client
-                         │
-                         ▼
-                ┌─────────────────┐
-                │ Payment Service │
-                │     :3001       │
-                └───────┬─────────┘
-                        │
-               ┌────────┴────────┐
-               │                 │
-               ▼                 ▼
-        ┌─────────────┐   ┌─────────────────┐
-        │ PostgreSQL  │   │ Payment Provider│
-        │             │   │     :4000       │
-        └─────────────┘   └─────────────────┘
+POST /payments
+GET  /payments/status?idempotencyKey=...
 ```
 
-The two systems answer different questions:
+The provider also maintains its own payment state.
+
+The recovery flow becomes:
 
 ```text
-Our database:
-
-"What does our service believe happened?"
-```
-
-The payment provider answers:
-
-```text
-"What actually happened to the payment?"
+Retry
+  │
+  ▼
+Local database
+  │
+  ├── COMPLETED
+  │      │
+  │      └── return stored result
+  │
+  └── PROCESSING
+          │
+          ▼
+   Query payment provider
+          │
+       ┌──┴──┐
+       │     │
+    FOUND   NOT FOUND
+       │     │
+       │     └── outcome still uncertain
+       │
+       ▼
+Mark local record COMPLETED
+       │
+       ▼
+Return original payment result
 ```
 
 ---
 
-## Simulating the Crash
+# Crash Simulation
 
-The recovery experiment deliberately crashes the payment service after the provider successfully processes the payment but before the service updates PostgreSQL.
+The recovery experiment deliberately crashes the payment service after the external provider confirms payment but before the local database is updated.
 
-The flow is:
+The sequence is:
 
 ```text
 Client
@@ -927,149 +483,73 @@ Client
   ▼
 Payment Service
   │
-  ├── INSERT PROCESSING
+  ├── INSERT → PROCESSING
   │
   ▼
 Payment Provider
   │
-  ├── Process payment
-  │
-  ├── Store payment
-  │
-  └── Return success
+  ├── payment succeeds
   │
   ▼
-💥 Payment Service crashes
+Payment Service
+  │
+  X CRASH
 ```
 
-The PostgreSQL record is left as:
+At this point:
 
 ```text
-idempotency_key    status
----------------------------
-order-payment-123  PROCESSING
+Local database:
+
+idempotency_key = order-payment-123
+status = PROCESSING
 ```
 
-while the provider already contains:
-
-```text
-order-payment-123
-        │
-        ▼
-provider-payment-...
-        │
-        ▼
-SUCCESS
-```
-
-This is the ambiguous state.
+But the provider contains the successful payment.
 
 ---
 
-## Recovery
+# Recovery
 
-After restarting the payment service, the same idempotency key is submitted again.
+The service is restarted.
+
+The client retries using the same idempotency key.
 
 The service finds:
 
 ```text
-Status: PROCESSING
+PROCESSING
 ```
 
-Instead of immediately creating another payment, it asks the provider for the status of the existing operation.
+Instead of blindly charging again, it asks the provider:
 
 ```text
-Payment Service
-       │
-       │ "What happened to
-       │  order-payment-123?"
-       ▼
-Payment Provider
-       │
-       │ Payment exists
-       ▼
-Payment Service
-       │
-       ▼
+Does a payment already exist
+for order-payment-123?
+```
+
+The provider responds with the existing payment.
+
+The local database is then updated:
+
+```sql
 UPDATE idempotency_keys
-SET status = 'COMPLETED'
+SET
+    status = 'COMPLETED',
+    result = $1,
+    updated_at = CURRENT_TIMESTAMP
+WHERE idempotency_key = $2;
 ```
 
-The service can then safely return the provider's original payment result.
-
----
-
-## Recovery Result
-
-The important behavior is:
-
-```text
-Existing idempotency record found
-
-Status: PROCESSING
-
-🔎 Checking payment provider...
-
-💳 Payment exists at provider
-
-✅ Payment recovered
-
-💾 Idempotency record updated
-
-📊 Status: COMPLETED
-```
-
-The payment was **not processed a second time**.
-
-The existing external result was recovered and used to complete our local record.
-
----
-
-# Reconciliation
-
-This process is an example of **reconciliation**.
-
-Instead of assuming that our local database contains the complete truth, the service compares its state with the external system:
-
-```text
-              Local State
-                   │
-                   │
-                   ▼
-             PROCESSING
-                   │
-                   │
-            Query provider
-                   │
-                   ▼
-          External State
-                   │
-                   ▼
-             PAYMENT EXISTS
-                   │
-                   ▼
-              COMPLETED
-```
-
-This is an important distributed-systems pattern because failures can happen between two systems.
-
-There is no single atomic operation covering:
-
-```text
-Our PostgreSQL database
-        +
-External payment provider
-```
-
-Therefore, the systems can temporarily disagree.
+The system has now reconciled its local state with the external system.
 
 ---
 
 # What If the Provider Has No Payment?
 
-The recovery process also needs to handle the opposite situation.
+This is the harder case.
 
-Suppose our database says:
+Suppose the local database says:
 
 ```text
 PROCESSING
@@ -1078,112 +558,76 @@ PROCESSING
 and the provider says:
 
 ```text
-Payment not found
+No payment found
 ```
 
-We cannot automatically conclude that the payment definitely failed.
+The system still needs to be careful.
 
-The external request could still be in progress, or the provider could have lost or delayed the status information.
+The absence of a payment does not necessarily prove that the original operation failed.
 
-For this educational implementation, the service returns:
+The provider could itself be:
 
-```text
-409 Conflict
+* temporarily unavailable,
+* eventually consistent,
+* processing the request asynchronously,
+* or unable to answer reliably.
 
-Payment outcome is still uncertain
-```
+Therefore, the recovery process should not blindly create another payment unless the external system provides a safe way to determine that the original operation did not happen.
 
-The important lesson is that **uncertainty itself is a state that needs to be handled**.
-
-A production payment system may use additional mechanisms such as provider webhooks, status APIs, reconciliation jobs, transaction records, or manual review depending on the payment provider.
+In this experiment, the service returns an uncertain state rather than creating a duplicate side effect.
 
 ---
 
-# Important Distributed Systems Lesson
+# Complete Lifecycle
 
-The complete problem is larger than simply preventing duplicate requests.
-
-We started with:
+The complete idempotency lifecycle is now:
 
 ```text
-Retry
-  ↓
-Duplicate side effect
-```
-
-and solved it with:
-
-```text
-Idempotency
-```
-
-But then we discovered another failure window:
-
-```text
-Payment succeeds
-       ↓
-Service crashes
-       ↓
-Local state remains PROCESSING
-```
-
-This means a robust distributed system needs to consider both:
-
-```text
-Duplicate processing
-        AND
-Unknown processing outcome
-```
-
-Idempotency protects against duplicate execution.
-
-Reconciliation helps recover when the outcome of an external operation is uncertain.
-
----
-
-# Complete Idempotency Lifecycle
-
-The lab now demonstrates a more realistic lifecycle:
-
-```text
-                    ABSENT
-                       │
-                       │ claim
-                       ▼
-                 PROCESSING
-                  /        \
-                 /          \
-                /            \
-        provider             provider
-         succeeds             outcome
-            │                  uncertain
-            ▼
-        COMPLETED              │
-            │                  │
-            │                  ▼
-            │             Reconciliation
-            │                  │
-            │           ┌──────┴──────┐
-            │           │             │
-            │       payment exists   unknown
-            │           │             │
-            │           ▼             ▼
-            │       COMPLETED      remain
-            │                        uncertain
-            ▼
-      Return stored result
+                 Request
+                    │
+                    ▼
+             Idempotency Key
+                    │
+                    ▼
+          Atomic database claim
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+        NEW                EXISTS
+          │                   │
+          ▼                   ▼
+     PROCESSING          Check status
+          │              │           │
+          │         PROCESSING   COMPLETED
+          │              │           │
+          ▼              ▼           ▼
+     External         Reconcile    Return
+      payment          provider    stored result
+          │
+          ▼
+       SUCCESS
+          │
+          ▼
+      COMPLETED
+          │
+          ▼
+     Store result
 ```
 
 ---
 
-# The Evolution of the Solution
+# Evolution of the Solution
 
-The lab has now progressed through four major stages:
+The implementation evolved through several stages.
 
-### 1. Naive idempotency
+### 1. Naive implementation
 
 ```text
-Check → Process → Store
+Check key
+   ↓
+Process payment
+   ↓
+Store result
 ```
 
 Problem:
@@ -1197,13 +641,19 @@ Race condition
 ### 2. In-memory reservation
 
 ```text
-Check → Reserve → Process → Complete
+Reserve key
+   ↓
+PROCESSING
+   ↓
+Process payment
+   ↓
+COMPLETED
 ```
 
 Problem:
 
 ```text
-State exists only inside one process
+State belongs to one process
 ```
 
 ---
@@ -1212,199 +662,80 @@ State exists only inside one process
 
 ```text
 Atomic INSERT
-      ↓
+   ↓
+Database owns coordination
+   ↓
 PROCESSING
-      ↓
-Process
-      ↓
+   ↓
+Process payment
+   ↓
 COMPLETED
 ```
 
 Problem:
 
 ```text
-What if the external operation succeeds
-but the service crashes before COMPLETED?
+Service can crash after external success
 ```
 
 ---
 
-### 4. Recovery / reconciliation
+### 4. Recovery and reconciliation
 
 ```text
-Atomic INSERT
-      ↓
 PROCESSING
-      ↓
-Call external system
-      ↓
-External operation succeeds
-      ↓
-Service crashes
-      ↓
-Restart
-      ↓
-Check external system
-      ↓
-Recover result
-      ↓
+   ↓
+External operation may have succeeded
+   ↓
+Query external system
+   ↓
+Reconcile local state
+   ↓
 COMPLETED
 ```
 
-This is the point where idempotency becomes more than simply "don't process twice."
-
-It becomes a mechanism for **tracking the lifecycle of a distributed operation and recovering from failures**.
+This addresses the ambiguous outcome rather than assuming that the local database always knows the truth.
 
 ---
 
-# Key Takeaways
+# Key Engineering Takeaways
 
-### 1. Retries can duplicate side effects
+### Idempotency is more than checking a key
 
-A timeout does not necessarily mean the downstream operation failed.
+The system must coordinate:
 
-The operation may still be executing.
+* ownership,
+* processing state,
+* completion state,
+* stored results,
+* retries,
+* concurrency,
+* failures,
+* and recovery.
 
-### 2. An idempotency key identifies a logical operation
+### Atomicity matters
 
-Both requests can have:
+The operation that claims the idempotency key must itself be safe against concurrent requests.
 
-```text
-Idempotency-Key: order-payment-123
-```
+### Shared state matters
 
-even though they are separate HTTP requests.
+In-memory state is insufficient when multiple service instances need to coordinate.
 
-The service uses the key to recognize that they represent the same logical operation.
+### `PROCESSING` is a real state
 
-### 3. Storing the result only after completion is insufficient
+An operation can be neither clearly successful nor clearly failed.
 
-This creates a window where multiple requests can begin processing the same operation.
+The system needs to represent that state explicitly.
 
-### 4. Reserve the operation before processing
+### External systems can be the source of truth
 
-The service must record:
+When an external side effect has occurred, the local service may need to query the external system to determine what actually happened.
 
-```text
-PROCESSING
-```
+### Recovery is part of the design
 
-before starting the side effect.
+A robust distributed system does not only define the happy path.
 
-This prevents a concurrent retry from starting the same operation again.
-
-### 5. Completed operations should return the stored result
-
-Once the operation reaches:
-
-```text
-COMPLETED
-```
-
-a later request using the same idempotency key should return the original result rather than executing the side effect again.
-
-### 6. Distributed systems need shared state
-
-An in-memory `Map` works for this educational experiment, but production systems require shared durable state and atomic operations.
-
-### 7. Atomic database operations matter
-
-A pattern such as:
-
-```sql
-INSERT ... ON CONFLICT DO NOTHING
-```
-
-allows the database to decide which request successfully claims the operation.
-
-### 8. Local state and external state can disagree
-
-Our database may say:
-
-```text
-PROCESSING
-```
-
-while an external payment provider has already processed the payment.
-
-### 9. A service crash can create an ambiguous outcome
-
-There can be a failure window between:
-
-```text
-External operation succeeds
-```
-
-and:
-
-```text
-Local database updated to COMPLETED
-```
-
-### 10. Recovery may require reconciliation
-
-When the outcome is uncertain, the service can query the external system and reconcile its local state with the external result.
-
----
-
-# What This Lab Demonstrates
-
-This lab connects several distributed-systems concepts:
-
-```text
-Timeout
-   │
-   ▼
-Retry
-   │
-   ▼
-Duplicate Processing
-   │
-   ▼
-Idempotency
-   │
-   ▼
-Concurrency / Atomicity
-   │
-   ▼
-Shared Persistent State
-   │
-   ▼
-Ambiguous Outcome
-   │
-   ▼
-Recovery / Reconciliation
-```
-
-The progression is important:
-
-```text
-Naive implementation
-        │
-        ▼
-Race condition discovered
-        │
-        ▼
-PROCESSING state introduced
-        │
-        ▼
-Duplicate processing prevented
-        │
-        ▼
-COMPLETED result reused
-        │
-        ▼
-Shared database introduced
-        │
-        ▼
-Failure during external operation
-        │
-        ▼
-Ambiguous outcome discovered
-        │
-        ▼
-External state reconciliation
-```
+It defines what happens when the process crashes at the worst possible moment.
 
 ---
 
@@ -1413,7 +744,7 @@ External state reconciliation
 * [x] Demonstrate idempotency key
 * [x] Demonstrate duplicate retry
 * [x] Reproduce race condition
-* [x] Prevent duplicate processing while request is `PROCESSING`
+* [x] Prevent duplicate processing while `PROCESSING`
 * [x] Store completed result
 * [x] Return stored result for completed operation
 * [x] Implement database-backed idempotency
@@ -1428,18 +759,10 @@ External state reconciliation
 
 ---
 
-# Next Step
+# Next
 
-The idempotency lab is now complete enough to demonstrate the core problem and several progressively stronger solutions.
+The next experiments will build on these failure-handling concepts and explore additional distributed-systems problems.
 
-The next distributed-systems concept can build on what we have learned here rather than adding more complexity to idempotency.
+The focus remains the same:
 
-```text
-Timeouts
-   ↓
-Retries
-   ↓
-Idempotency
-   ↓
-?
-```
+**Understand the failure → observe the behavior → design the mitigation → verify the result.**
