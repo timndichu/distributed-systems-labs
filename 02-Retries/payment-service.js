@@ -1,12 +1,19 @@
 const http = require("http");
 
+let paymentCount = 0;
+
 const server = http.createServer((req, res) => {
   if (req.method === "POST" && req.url === "/payments") {
-    console.log("💰 Payment request received");
-    console.log("⏳ Processing payment...");
+    paymentCount++;
+
+    const currentPayment = paymentCount;
+
+    console.log(`\n💰 Payment request received`);
+    console.log(`🆔 Payment operation #${currentPayment}`);
+    console.log(`⏳ Processing payment...`);
 
     setTimeout(() => {
-      console.log("✅ Payment processed");
+      console.log(`✅ Payment #${currentPayment} processed`);
 
       res.writeHead(200, {
         "Content-Type": "application/json",
@@ -15,6 +22,7 @@ const server = http.createServer((req, res) => {
       res.end(
         JSON.stringify({
           success: true,
+          paymentId: currentPayment,
           message: "Payment processed",
         })
       );

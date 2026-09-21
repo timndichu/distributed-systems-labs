@@ -6,11 +6,11 @@ The goal is to move beyond theoretical understanding by building small systems, 
 
 ## Labs
 
-| #  | Topic       | Status         |
-| -- | ----------- | -------------- |
-| 01 | Timeouts    | 🚧 In Progress |
-| 02 | Retries     | ⏳ Planned      |
-| 03 | Idempotency | ⏳ Planned      |
+| #  | Topic                            | Status          |
+| -- | ------------------------------   | --------------  |
+| 01 | [Timeouts](./01-Timeouts/)       | 🚧 In Progress  |
+| 02 | [Retries](./02-Retries/)         | ⏳ Planned      |
+| 03 | [Idempotency](./03-Idempotency/) | ⏳ Planned      |
 
 More labs will be added as I progress through distributed systems and system design topics.
 
