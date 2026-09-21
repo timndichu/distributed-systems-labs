@@ -575,3 +575,434 @@ COMPLETED result reused
 The current implementation uses an in-memory `Map`.
 
 The next stage is to replace this with a **database-backed idempotency mechanism** and explore how a unique constraint and atomic database operation protect the system when multiple service instances are running.
+
+
+# Experiment 4 — Database-Backed Idempotency
+
+The in-memory solution works within a single Node.js process, but it has an important limitation.
+
+Imagine we have two payment service instances:
+
+```text
+                 ┌──────────────────────┐
+                 │      Client          │
+                 └──────────┬───────────┘
+                            │
+                 ┌──────────┴───────────┐
+                 │                      │
+                 ▼                      ▼
+        Payment Service 1       Payment Service 2
+             :3001                    :3002
+                 │                      │
+                 └──────────┬───────────┘
+                            │
+                            ▼
+                     PostgreSQL
+```
+
+Each process has its own memory.
+
+Therefore:
+
+```text
+Service 1
+    |
+    v
+Map A
+
+Service 2
+    |
+    v
+Map B
+```
+
+Service 1 cannot see Service 2's `Map`.
+
+We therefore need **shared state**.
+
+---
+
+## Database Schema
+
+We created a PostgreSQL database:
+
+```text
+idempotency_lab
+```
+
+with the following table:
+
+```sql
+CREATE TABLE idempotency_keys (
+    id SERIAL PRIMARY KEY,
+    idempotency_key VARCHAR(255) NOT NULL UNIQUE,
+    status VARCHAR(20) NOT NULL,
+    result JSONB,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+The important part is:
+
+```sql
+idempotency_key VARCHAR(255) NOT NULL UNIQUE
+```
+
+This means PostgreSQL guarantees that two rows cannot have the same idempotency key.
+
+---
+
+## Atomic Claim
+
+The payment service attempts to claim the idempotency key using:
+
+```sql
+INSERT INTO idempotency_keys (
+    idempotency_key,
+    status
+)
+VALUES ($1, 'PROCESSING')
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING *;
+```
+
+This is important because the operation is atomic.
+
+If the insert succeeds:
+
+```text
+rowCount === 1
+```
+
+This service successfully claimed the operation.
+
+It can process the payment.
+
+If the insert does not insert anything:
+
+```text
+rowCount === 0
+```
+
+the key already exists.
+
+The service then checks the existing record.
+
+---
+
+## Why Not SELECT Then INSERT?
+
+A tempting implementation would be:
+
+```text
+SELECT
+  ↓
+Does key exist?
+  ↓
+No
+  ↓
+INSERT
+```
+
+But two service instances could do this simultaneously:
+
+```text
+Service 1                 Service 2
+    |                         |
+    |------ SELECT ---------->|
+    |                         |
+    |<----- not found --------|
+    |                         |
+    |                    SELECT
+    |                         |
+    |                    not found
+    |                         |
+    |------ INSERT ---------->|
+    |                    INSERT
+```
+
+Both services could believe they were allowed to process the payment.
+
+Instead, we let PostgreSQL perform the uniqueness check atomically:
+
+```text
+Service 1 ─────┐
+               │
+               ▼
+          PostgreSQL
+          UNIQUE KEY
+               ▲
+               │
+Service 2 ─────┘
+```
+
+Only one instance can successfully claim the key.
+
+---
+
+## Two-Instance Experiment
+
+We started two copies of the payment service:
+
+```text
+Payment Service 1 → localhost:3001
+Payment Service 2 → localhost:3002
+```
+
+Both received:
+
+```text
+Idempotency-Key: order-payment-123
+```
+
+The client intentionally sent both requests at almost the same time.
+
+### One instance successfully claimed the key
+
+```text
+💰 payment-service-1
+🔑 Idempotency-Key: order-payment-123
+
+🔒 Idempotency key successfully claimed
+📊 Status: PROCESSING
+⏳ Processing payment...
+```
+
+### The second instance detected the existing operation
+
+```text
+💰 payment-service-2
+🔑 Idempotency-Key: order-payment-123
+
+♻️ Idempotency key already exists
+📊 Existing status: PROCESSING
+🚫 Payment already being processed
+```
+
+After processing completed:
+
+```text
+✅ Payment processed
+💾 Result stored in database
+📊 Status: COMPLETED
+```
+
+---
+
+## Database Verification
+
+We verified the result directly in PostgreSQL:
+
+```sql
+SELECT
+    id,
+    idempotency_key,
+    status,
+    result,
+    created_at,
+    updated_at
+FROM idempotency_keys;
+```
+
+The database contained **one record** for:
+
+```text
+order-payment-123
+```
+
+with:
+
+```text
+status = COMPLETED
+```
+
+This proves that two independent service instances did not create two payment operations.
+
+---
+
+# The Evolution of the Solution
+
+The lab progressed through three increasingly robust approaches:
+
+### 1. Naive
+
+```text
+Check → Process → Store
+```
+
+Problem:
+
+```text
+Race condition
+```
+
+---
+
+### 2. In-memory reservation
+
+```text
+Check → Reserve → Process → Complete
+```
+
+Problem:
+
+```text
+State exists only inside one process
+```
+
+Multiple service instances cannot share it.
+
+---
+
+### 3. Database-backed reservation
+
+```text
+Atomic INSERT
+      ↓
+   PROCESSING
+      ↓
+   Process
+      ↓
+   COMPLETED
+      ↓
+ Store result
+```
+
+The database becomes the shared source of truth.
+
+```text
+              PostgreSQL
+                  │
+        ┌─────────┴─────────┐
+        │                   │
+        ▼                   ▼
+   Service 1           Service 2
+```
+
+This allows independent service instances to coordinate.
+
+---
+
+# Correct Idempotency Model
+
+A robust idempotent operation should conceptually maintain a state like:
+
+```text
+             ┌─────────────┐
+             │   ABSENT    │
+             └──────┬──────┘
+                    │
+                    │ claim key
+                    ▼
+             ┌─────────────┐
+             │ PROCESSING  │
+             └──────┬──────┘
+                    │
+                    │ payment succeeds
+                    ▼
+             ┌─────────────┐
+             │  COMPLETED  │
+             └─────────────┘
+```
+
+Repeated requests behave differently depending on the state:
+
+```text
+ABSENT
+  → process request
+
+PROCESSING
+  → do not start another operation
+
+COMPLETED
+  → return stored result
+```
+
+---
+
+# Why Shared State Matters in Distributed Systems
+
+A major lesson from this experiment is that **local memory is not shared memory**.
+
+With one process:
+
+```text
+Service
+  |
+  └── Map
+```
+
+the `Map` can work for demonstrating the concept.
+
+With multiple instances:
+
+```text
+Service 1 ── Map A
+
+Service 2 ── Map B
+```
+
+each instance has a different view of the world.
+
+A shared database provides:
+
+```text
+Service 1 ──┐
+            │
+            ▼
+        PostgreSQL
+            ▲
+            │
+Service 2 ──┘
+```
+
+The database can therefore coordinate operations across instances.
+
+---
+
+# Key Takeaways
+
+* A timeout does not necessarily cancel the downstream operation.
+* Retrying a request can create duplicate side effects.
+* An idempotency key gives repeated requests the same logical identity.
+* Simply checking whether a key exists is not enough.
+* The idempotency key must be reserved before processing begins.
+* In-memory state works only within the process that owns it.
+* Multiple service instances require shared state.
+* PostgreSQL's `UNIQUE` constraint provides a strong primitive for preventing duplicate keys.
+* `INSERT ... ON CONFLICT DO NOTHING` provides an atomic way to claim an idempotency key.
+* The database can maintain the lifecycle of an operation:
+
+```text
+ABSENT → PROCESSING → COMPLETED
+```
+
+---
+
+# Status
+
+* [x] Demonstrate idempotency key
+* [x] Demonstrate duplicate retry
+* [x] Reproduce race condition
+* [x] Prevent duplicate processing while `PROCESSING`
+* [x] Store completed result
+* [x] Return stored result for completed operation
+* [x] Implement database-backed idempotency
+* [x] Demonstrate shared state across multiple service instances
+* [x] Use database uniqueness to prevent duplicate claims
+* [ ] Explore failure handling for `PROCESSING` records
+* [ ] Explore database-backed idempotency with transactions
+* [ ] Explore what happens when the payment succeeds but the service crashes before marking the request `COMPLETED`
+
+---
+
+# Next Step
+
+The next interesting problem is:
+
+> **What happens if the payment succeeds, but the payment service crashes before updating the idempotency record to `COMPLETED`?**
+
+This brings us to an important distributed-systems problem involving **ambiguous outcomes and recovery**.
+
+We will explore that before moving on to the next major distributed-systems pattern.

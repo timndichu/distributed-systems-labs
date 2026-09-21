@@ -1,5 +1,5 @@
 {
-  "name": "01-timeouts",
+  "name": "03-idempotency",
   "version": "1.0.0",
   "description": "A collection of small, practical experiments designed to explore distributed systems concepts through runnable code.",
   "main": "index.js",
@@ -9,5 +9,9 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^18.0.1",
+    "pg": "^8.23.0"
+  }
 }
