@@ -116,7 +116,35 @@ The idempotency check exists, but it is not sufficient.
 
 # Experiment 3 — Reserve Before Processing
 
-The next implementation reserves the key immediately.
+The previous implementation checked whether an idempotency key existed, but only stored the key **after** the payment finished.
+
+That left a race condition:
+
+```text
+Request #1                  Request #2
+    │                           │
+    ▼                           ▼
+Check key                   Check key
+    │                           │
+    ▼                           ▼
+Not found                   Not found
+    │                           │
+    ▼                           ▼
+Process payment             Process payment
+    │                           │
+    ▼                           ▼
+Payment A                   Payment B
+```
+
+Both requests can observe that the key does not exist before either request has a chance to store it.
+
+The solution is to **reserve the idempotency key before starting the payment operation**.
+
+---
+
+## Reserving the Key
+
+The payment service immediately creates a `PROCESSING` record:
 
 ```js
 payments.set(idempotencyKey, {
@@ -124,76 +152,207 @@ payments.set(idempotencyKey, {
 });
 ```
 
-The state machine becomes:
+Only after successfully reserving the key does the service begin processing the payment.
+
+The flow becomes:
 
 ```text
-             ┌──────────────┐
-             │              │
-             ▼              │
-        PROCESSING          │
-             │              │
-             ▼              │
-         COMPLETED          │
+New Request
+     │
+     ▼
+Check Idempotency Key
+     │
+     ▼
+Key does not exist
+     │
+     ▼
+Reserve Key
+     │
+     ▼
+PROCESSING
+     │
+     ▼
+Process Payment
+     │
+     ▼
+COMPLETED
 ```
 
-A second request now sees:
+---
+
+## What Happens to a Duplicate Request?
+
+Now consider a second request arriving while the first payment is still being processed.
+
+```text
+Request #1                  Request #2
+    │                           │
+    ▼                           ▼
+Reserve key                 Check key
+    │                           │
+    ▼                           ▼
+PROCESSING                  PROCESSING
+    │                           │
+    ▼                           ▼
+Process payment             Do not process
+    │                        duplicate
+    ▼
+COMPLETED
+```
+
+The second request can see that the operation is already being processed and therefore does not start another payment.
+
+This closes the race window that existed in the naive implementation.
+
+---
+
+## State Machine
+
+The idempotency record now has two important states:
+
+```text
+                 ┌──────────────┐
+                 │   New Key    │
+                 └──────┬───────┘
+                        │
+                        │ reserve
+                        ▼
+                 ┌──────────────┐
+                 │ PROCESSING   │
+                 └──────┬───────┘
+                        │
+                        │ payment succeeds
+                        ▼
+                 ┌──────────────┐
+                 │  COMPLETED   │
+                 └──────────────┘
+```
+
+A duplicate request behaves differently depending on the current state:
+
+```text
+Existing Key
+     │
+     ▼
+Check Status
+     │
+ ┌───┴──────────────┐
+ │                  │
+ ▼                  ▼
+PROCESSING       COMPLETED
+ │                  │
+ ▼                  ▼
+Do not start      Return
+another payment   stored result
+```
+
+---
+
+## Why This Works
+
+The important change is **when the key is recorded**.
+
+### Before
+
+```text
+Check key
+   ↓
+Process payment
+   ↓
+Store key
+```
+
+There is a race window between the check and the store.
+
+### After
+
+```text
+Reserve key
+   ↓
+PROCESSING
+   ↓
+Process payment
+   ↓
+COMPLETED
+```
+
+The key is now recorded before the operation that can create the side effect begins.
+
+Therefore, another request arriving during processing can see:
 
 ```text
 PROCESSING
 ```
 
-and does not start another payment.
+instead of believing that the operation is new.
 
-The flow becomes:
+---
+
+## Result
+
+With the race-condition fix:
 
 ```text
 Request #1
     │
-    ├── reserve key
+    ▼
+PROCESSING
     │
-    └── PROCESSING
-          │
-          ▼
-       payment
-
-
-Request #2
-    │
-    └── sees PROCESSING
-            │
-            └── do not process again
+    ├───────────────┐
+    │               │
+    ▼               │
+Payment processing │
+    │               │
+    ▼               │
+COMPLETED           │
+                    │
+Request #2 ─────────┘
+       │
+       ▼
+   sees existing key
+       │
+       ▼
+does not create another payment
 ```
 
-This solves the race condition within a single process.
-
-But another problem remains.
+The system now prevents concurrent duplicate processing within the same service instance.
 
 ---
 
-# The Shared-State Problem
+## Important Limitation
 
-An in-memory `Map` only exists inside one process.
+This solution uses an in-memory `Map`:
 
-Consider:
-
-```text
-                 ┌────────────────────┐
-                 │      Database      │
-                 └────────────────────┘
-                       ▲        ▲
-                       │        │
-                       │        │
-              ┌────────┘        └─────────┐
-              │                           │
-      ┌───────────────┐           ┌───────────────┐
-      │ Payment       │           │ Payment       │
-      │ Service #1    │           │ Service #2    │
-      └───────────────┘           └───────────────┘
+```js
+const payments = new Map();
 ```
 
-If each instance maintains its own `Map`, both instances can believe that a key is new.
+That means the idempotency state exists only inside a single process.
 
-For distributed coordination, the idempotency state needs to be shared.
+If the application runs multiple instances:
+
+```text
+                 ┌──────────────────┐
+                 │      Client      │
+                 └────────┬─────────┘
+                          │
+                  ┌───────┴────────┐
+                  │                │
+                  ▼                ▼
+          Payment Service #1   Payment Service #2
+                  │                │
+             local Map          local Map
+```
+
+Each instance has its own idempotency state.
+
+Both instances could therefore believe that the same key is new.
+
+So while reserving the key fixes the race condition **within one process**, it does not solve coordination across multiple service instances.
+
+That leads to the next experiment:
+
+**Database-backed idempotency.**
 
 ---
 
