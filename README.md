@@ -28,16 +28,50 @@ Each lab focuses on a specific distributed-systems problem and follows a practic
 ## Repository Structure
 
 ```text
+## Repository Structure
+
+```text
 distributed-systems-labs/
 │
-├── 01-timeouts/
+├── 01-Timeouts/
 │   ├── README.md
 │   ├── client.js
 │   ├── order-service.js
 │   ├── payment-service.js
 │   └── package.json
 │
+├── 02-Retries/
+│   ├── README.md
+│   ├── client.js
+│   ├── order-service.js
+│   ├── payment-service.js
+│   └── package.json
+│
+├── 03-Idempotency/
+│   ├── README.md
+│   │
+│   ├── 01-naive/
+│   │   ├── client.js
+|   |   ├── order-service.js
+│   │   └── payment-service.js
+│   │
+│   ├── 02-race-condition-fixed/
+│   │   ├── client.js
+|   |   ├── order-service.js
+│   │   └── payment-service.js
+│   │
+│   └── 03-database/
+│       ├── client.js
+│       ├── db.js
+│       ├── payment-provider.js
+│       ├── payment-service.js
+│       ├── payment-service-2.js
+│       ├── payment-service-recovery.js
+│       ├── test-db.js
+│       └── package.json
+│
 └── README.md
+
 ```
 
 ## Concepts
