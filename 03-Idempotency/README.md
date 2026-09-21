@@ -25,7 +25,7 @@ Client
    ▼
 ┌──────────────────┐
 │  Order Service   │
-│   :3000          │
+│      :3000       │
 └────────┬─────────┘
          │
          │ POST /payments
@@ -33,7 +33,7 @@ Client
          ▼
 ┌──────────────────┐
 │ Payment Service  │
-│   :3001          │
+│      :3001       │
 └──────────────────┘
 ```
 
@@ -47,13 +47,13 @@ This creates the possibility that the caller will retry while the original payme
 
 # Experiment 1 — Naive Idempotency
 
-The first implementation stores the payment result using the idempotency key:
+The first implementation stored the payment result using the idempotency key:
 
 ```js
 processedPayments.set(idempotencyKey, paymentResult);
 ```
 
-When a request arrives, the service checks:
+When a request arrived, the service checked:
 
 ```js
 if (processedPayments.has(idempotencyKey)) {
@@ -63,9 +63,9 @@ if (processedPayments.has(idempotencyKey)) {
 
 This looks correct at first.
 
-However, the result is only stored **after processing finishes**.
+However, the result was only stored **after processing finished**.
 
-That creates a race condition.
+That created a race condition.
 
 ---
 
@@ -128,7 +128,7 @@ This proves that the payment was processed twice.
 
 # Why Did This Happen?
 
-The problem is the timing.
+The problem was the timing.
 
 ```text
 Time
@@ -158,9 +158,9 @@ The important detail is that the idempotency key wasn't recorded when processing
 
 It was only recorded when processing **finished**.
 
-Therefore, during the period where the first request was still processing:
+Therefore, while the first request was still processing:
 
-```text
+```js
 processedPayments.has("order-payment-123")
 ```
 
@@ -242,9 +242,21 @@ COMPLETED
 
 ---
 
-# Correct Idempotency Model
+# Experiment 2 — Fixing the Race Condition
 
-A better implementation should behave like this:
+The implementation was changed so that the idempotency key is **reserved before payment processing begins**.
+
+The service now stores:
+
+```js
+payments.set(idempotencyKey, {
+  status: "PROCESSING",
+});
+```
+
+before starting the payment operation.
+
+The lifecycle is now:
 
 ```text
 Request #1
@@ -262,7 +274,7 @@ Process payment
 Mark COMPLETED
 ```
 
-If Request #2 arrives while Request #1 is processing:
+If another request arrives while the first request is processing:
 
 ```text
 Request #2
@@ -277,19 +289,114 @@ Status = PROCESSING
 Do NOT process payment again
 ```
 
-If a later request arrives after completion:
+---
+
+## Observed Result After the Fix
+
+The Payment Service produced:
 
 ```text
-Request #3
-    │
-    ▼
-Idempotency key exists
-    │
-    ▼
-Status = COMPLETED
-    │
-    ▼
+💰 Payment request received
+🔑 Idempotency-Key: order-payment-123
+🆕 New payment request
+🔒 Idempotency key reserved
+📊 Status: PROCESSING
+⏳ Processing payment...
+
+💰 Payment request received
+🔑 Idempotency-Key: order-payment-123
+♻️ Existing idempotency record found
+📊 Status: PROCESSING
+⏳ Payment is already being processed
+🚫 NOT starting another payment
+
+✅ Payment processed
+💾 Result stored
+📊 Status: COMPLETED
+```
+
+The key observation is that there is now only **one payment processing operation**.
+
+The retry detects:
+
+```text
+Status: PROCESSING
+```
+
+and does not start another payment.
+
+---
+
+# Experiment 3 — Retry After Completion
+
+The next scenario tests what happens when the same request is retried **after the original operation has completed**.
+
+The expected lifecycle is:
+
+```text
+PROCESSING
+     │
+     ▼
+COMPLETED
+     │
+     │
+     │ retry
+     ▼
 Return stored result
+```
+
+After the first payment completed, another request was sent using the same:
+
+```text
+Idempotency-Key: order-payment-123
+```
+
+The service detected the existing completed operation and returned the previously stored result instead of processing another payment.
+
+Expected behavior:
+
+```text
+💰 Payment request received
+🔑 Idempotency-Key: order-payment-123
+♻️ Existing idempotency record found
+📊 Status: COMPLETED
+✅ Payment already completed
+📦 Returning stored result
+```
+
+No new payment should be created.
+
+---
+
+# Correct Idempotency Model
+
+The complete behavior is now:
+
+```text
+                    Request
+                       │
+                       ▼
+              Does key exist?
+                 /          \
+               No            Yes
+               │              │
+               ▼              ▼
+          PROCESSING       Check status
+               │           /          \
+               │          /            \
+               │    PROCESSING       COMPLETED
+               │         │               │
+               │         ▼               ▼
+               │    Don't duplicate   Return result
+               │
+               ▼
+           Process payment
+               │
+               ▼
+           COMPLETED
+               │
+               ▼
+          Store result
 ```
 
 ---
@@ -376,27 +483,41 @@ This creates a window where multiple requests can begin processing the same oper
 
 ---
 
-### 4. Idempotency needs concurrency protection
+### 4. Reserve the operation before processing
 
-The system needs to reserve the operation when processing begins:
+The service must record:
 
 ```text
 PROCESSING
 ```
 
-rather than waiting until completion.
+before starting the side effect.
+
+This prevents a concurrent retry from starting the same operation again.
 
 ---
 
-### 5. Distributed systems need shared state
+### 5. Completed operations should return the stored result
 
-An in-memory map works for this educational experiment, but production systems require shared durable state and atomic operations.
+Once the operation reaches:
+
+```text
+COMPLETED
+```
+
+a later request using the same idempotency key should return the original result rather than executing the side effect again.
+
+---
+
+### 6. Distributed systems need shared state
+
+An in-memory `Map` works for this educational experiment, but production systems require shared durable state and atomic operations.
 
 ---
 
 ## What This Lab Demonstrates
 
-This lab connects three concepts:
+This lab connects several distributed-systems concepts:
 
 ```text
 Timeout
@@ -412,9 +533,28 @@ Idempotency
    │
    ▼
 Concurrency / Atomicity
+   │
+   ▼
+Shared Persistent State
 ```
 
-The next stage of this lab will modify the implementation to correctly handle the `PROCESSING` state and prevent concurrent duplicate processing.
+The progression is important:
+
+```text
+Naive implementation
+        │
+        ▼
+Race condition discovered
+        │
+        ▼
+PROCESSING state introduced
+        │
+        ▼
+Duplicate processing prevented
+        │
+        ▼
+COMPLETED result reused
+```
 
 ---
 
@@ -423,6 +563,15 @@ The next stage of this lab will modify the implementation to correctly handle th
 * [x] Demonstrate idempotency key
 * [x] Demonstrate duplicate retry
 * [x] Reproduce race condition
-* [ ] Prevent duplicate processing while request is `PROCESSING`
-* [ ] Store completed result
+* [x] Prevent duplicate processing while request is `PROCESSING`
+* [x] Store completed result
+* [x] Return stored result for completed operation
 * [ ] Explore database-backed idempotency
+
+---
+
+## Next Step
+
+The current implementation uses an in-memory `Map`.
+
+The next stage is to replace this with a **database-backed idempotency mechanism** and explore how a unique constraint and atomic database operation protect the system when multiple service instances are running.
