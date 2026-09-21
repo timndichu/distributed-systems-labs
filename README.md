@@ -31,11 +31,11 @@ The repository currently explores:
 
 ## Labs
 
-| #  | Topic       | Status     |
-| -- | ----------- | ---------- |
-| 01 | Timeouts    | ✅ Complete |
-| 02 | Retries     | ✅ Complete |
-| 03 | Idempotency | ✅ Complete |
+| #  | Topic                            | Status       |
+| -- | -------------------------------- | -------------|
+| 01 | [Timeouts](./01-Timeouts/)       | ✅ Complete |
+| 02 | [Retries](./02-Retries/)         | ✅ Complete |
+| 03 | [Idempotency](./03-Idempotency/) | ✅ Complete |
 
 More distributed-systems scenarios will be added as the repository evolves.
 
