@@ -1,20 +1,24 @@
-# Circuit Breaker Lab
+# Circuit Breaker Lab — Version 3
 
-A practical system-design lab for understanding the **Circuit Breaker pattern from first principles**.
+## Overview
 
-This lab is part of the `distributed-systems-labs` repository.
+This lab explores the **Circuit Breaker pattern** from first principles.
 
-## Goal
+The goal was not to start with a framework annotation such as `@CircuitBreaker`, but to understand the problem, build a simple implementation, deliberately break it, observe its behavior under failure and concurrency, and improve the design.
 
-The goal is to understand why Circuit Breakers exist, how they protect a system from failing dependencies, and how the Circuit Breaker state machine works.
+The lab evolved through three versions:
 
-We are intentionally building the pattern ourselves before using a production library such as Resilience4j.
+```text
+V1 → Basic Circuit Breaker
+V2 → Thread-safe HALF_OPEN probe
+V3 → Failure-rate-based Circuit Breaker with a sliding window
+```
 
 ---
 
-# 1. Problem We Are Solving
+# 1. Why Circuit Breakers Exist
 
-Consider an Order Service that depends on a Payment Service:
+In a distributed system, one service frequently depends on another:
 
 ```text
 Client
@@ -26,311 +30,121 @@ Order Service
 Payment Service
 ```
 
-Normally:
+If the Payment Service becomes unavailable, the Order Service may continue sending requests to it.
 
-```text
-Request
-   |
-   v
-Order Service
-   |
-   v
-Payment Service
-   |
-   v
-Success
-```
+Without protection, this can cause:
 
-But if Payment Service becomes unavailable:
+- requests waiting for unavailable dependencies
+- thread and connection-pool exhaustion
+- retry amplification
+- failures propagating upstream
+- a local dependency failure becoming a wider system failure
 
-```text
-Order Service
-      |
-      v
-Payment Service
-      |
-      X
-   Failure
-```
+A Circuit Breaker changes this behavior.
 
-The Order Service may continue sending requests to a dependency that is already known to be unhealthy.
-
-If requests also use timeouts and retries, the problem can become worse:
-
-```text
-Many requests
-     |
-     v
-Payment Service
-     X
-     |
-     +--> timeouts
-     |
-     +--> retries
-     |
-     +--> more load
-```
-
-This can contribute to **cascading failures** and resource exhaustion.
-
-## Key principle
-
-> A failing dependency should not be allowed to consume unlimited resources from the service that depends on it.
-
-A Circuit Breaker helps by temporarily stopping calls to a dependency that is repeatedly failing.
+Instead of repeatedly calling a dependency known to be failing, the caller temporarily stops making calls and fails fast.
 
 ---
 
-# 2. Circuit Breaker Concept
+# 2. Circuit Breaker State Machine
 
-The Circuit Breaker sits between a caller and a downstream dependency:
-
-```text
-Client
-  |
-  v
-Order Service
-  |
-  v
-Circuit Breaker
-  |
-  v
-Payment Service
-```
-
-Instead of continually calling a failing Payment Service, the Circuit Breaker can **fail fast** and prevent the request from reaching the dependency.
-
----
-
-# 3. Why "Fail Fast" Matters
-
-Without a Circuit Breaker:
+The core state machine has three states:
 
 ```text
-Request
-   |
-   v
-Payment
-   |
-   | wait
-   v
-Timeout
-   |
-   v
-Retry
-   |
-   v
-Payment
-   |
-   | wait
-   v
-Timeout
-```
-
-The caller can spend significant time waiting for a dependency that is already unhealthy.
-
-With an open Circuit Breaker:
-
-```text
-Request
-   |
-   v
-Circuit Breaker
-   |
-   X
-Fail immediately
-```
-
-The downstream service is not called.
-
-This reduces unnecessary work and protects resources in the calling service.
-
----
-
-# 4. Circuit Breaker States
-
-A Circuit Breaker normally has three states.
-
-```text
-              failure threshold
-                     |
-                     v
-                +---------+
-                | CLOSED  |
-                +----+----+
-                     |
-                     | repeated failures
-                     v
-                +---------+
-                |  OPEN   |
-                +----+----+
-                     |
-                     | wait period
-                     v
-                +---------+
-                |HALF-OPEN|
-                +----+----+
-                     |
-             test request
-                /        \
-           success       failure
-              |             |
-              v             v
-           CLOSED          OPEN
+             failure threshold
+        ┌──────────────────────────┐
+        │                          ▼
+     CLOSED ─────────────────────> OPEN
+        ▲                            │
+        │                            │ wait duration
+        │                            ▼
+        │                        HALF_OPEN
+        │                         /       \
+        │                   success       failure
+        │                     │              │
+        └─────────────────────┘              │
+                                             ▼
+                                            OPEN
 ```
 
 ## CLOSED
 
-Normal operation.
-
-Requests are allowed to reach the downstream service.
-
-The Circuit Breaker records successes and failures.
-
-Example:
-
-```text
-Request 1 -> SUCCESS
-Request 2 -> SUCCESS
-Request 3 -> FAILURE
-Request 4 -> SUCCESS
-```
+Normal operation. Requests are allowed and outcomes are recorded.
 
 ## OPEN
 
-The dependency has experienced enough failures to trip the circuit.
+The dependency has crossed the configured failure threshold.
 
-Requests are rejected without calling the downstream service.
+Requests are rejected immediately. The dependency is not called.
+
+## HALF_OPEN
+
+After the configured open duration, the breaker allows a controlled test request to determine whether the dependency has recovered.
+
+Success:
 
 ```text
-Order Service
-      |
-      v
-Circuit Breaker
-      |
-      X
-Payment Service
+HALF_OPEN → CLOSED
 ```
 
-The request **fails fast**.
-
-## HALF-OPEN
-
-After a configured waiting period, the Circuit Breaker allows a limited test request through.
-
-If the dependency succeeds:
+Failure:
 
 ```text
-HALF-OPEN -> CLOSED
-```
-
-If it fails:
-
-```text
-HALF-OPEN -> OPEN
+HALF_OPEN → OPEN
 ```
 
 ---
 
-# 5. Relationship With Other Failure Patterns
+# 3. Relationship to Other Failure-Handling Patterns
 
-We have already studied:
-
-### Timeout
-
-> Don't wait forever.
-
-```text
-Payment
-   |
-   +--- 5 seconds ---> TIMEOUT
-```
-
-### Retry
-
-> A failure may be temporary, so try again.
-
-```text
-Payment
-   |
-   X
-   |
- Retry
-```
-
-### Idempotency
-
-> If a request is retried, make sure the operation does not accidentally happen multiple times.
-
-### Circuit Breaker
-
-> The dependency is repeatedly failing, so stop calling it temporarily.
-
-These patterns solve different parts of the failure problem.
+Circuit Breakers solve a different problem from timeouts, retries, and idempotency.
 
 ```text
 Timeout
-   |
-   v
-Request fails
-   |
-   v
-Retry (when appropriate)
-   |
-   v
-Repeated failures
-   |
-   v
+    ↓
+Don't wait forever.
+
+Retry
+    ↓
+Try again when a failure may be transient.
+
+Idempotency
+    ↓
+Make repeated attempts safe.
+
 Circuit Breaker
-   |
-   v
-Fail fast
+    ↓
+Stop repeatedly calling a dependency that is failing.
 ```
 
-They should not automatically be applied to every request in every system.
+A realistic distributed system often combines these mechanisms.
 
 ---
 
-# 6. Practical Lab Setup
+# 4. Project Setup
 
-## Technology
+The lab uses:
 
-- Java 21 LTS
-- Spring Boot 4.1.1
+- Java 21
+- Spring Boot
 - Maven Wrapper
 - Spring Web
-- Embedded Tomcat
-- Windows 11
 
-The project was created with Spring Initializr.
+Run the application:
 
-Project structure:
-
-```text
-04-Circuit-Breaker/
-└── circuit-breaker-demo/
-    ├── src/
-    ├── pom.xml
-    ├── mvnw
-    └── mvnw.cmd
-```
-
-The application currently runs on:
-
-```text
-http://localhost:8080
+```powershell
+.\mvnw.cmd spring-boot:run
 ```
 
 ---
 
-# 7. Current Architecture
+# 5. Baseline Architecture
 
-At this stage, the application intentionally has **no Circuit Breaker**.
+The initial implementation intentionally kept the Payment Service inside the same Spring Boot application:
 
 ```text
 Client
   |
-  | POST /orders
   v
 Order Controller
   |
@@ -341,226 +155,741 @@ Order Service
 Payment Service
 ```
 
-The Payment Service is currently implemented inside the same Spring Boot application to keep the first experiment simple.
+This is not intended to simulate a real network failure yet.
 
-Later, the lab can evolve into separate services communicating over HTTP.
+Keeping both services in the same application makes it easier to experiment with the Circuit Breaker state machine before introducing network-level failure.
 
 ---
 
-# 8. Payment Service
+# 6. Failure Injection
 
-The Payment Service has a simple availability switch.
+The Payment Service has an availability switch:
 
-Conceptually:
+```http
+POST /payment/availability/false
+```
+
+makes the payment service unavailable.
+
+```http
+POST /payment/availability/true
+```
+
+makes it available again.
+
+This allowed failures to be reproduced deterministically.
+
+The payment service was also temporarily slowed down with:
 
 ```java
-private boolean available = true;
+Thread.sleep(3000);
 ```
 
-When available:
-
-```text
-processPayment()
-      |
-      v
-Payment successful
-```
-
-When unavailable:
-
-```text
-processPayment()
-      |
-      v
-RuntimeException
-```
-
-This gives us a controlled way to simulate a failing dependency.
+The artificial delay made the concurrency experiment easier to observe because a very fast in-process method could complete before concurrent requests had an opportunity to overlap.
 
 ---
 
-# 9. Failure Simulation
+# 7. Version 1 — Basic Circuit Breaker
 
-The Payment Controller exposes:
-
-```text
-POST /payment/availability/{available}
-```
-
-To make Payment unavailable:
+The first implementation used a simple consecutive-failure threshold:
 
 ```text
-POST http://localhost:8080/payment/availability/false
+Failure threshold = 3
+Open duration = 10 seconds
 ```
 
-To make it available again:
-
-```text
-POST http://localhost:8080/payment/availability/true
-```
-
-This is only a simulation mechanism for the lab.
-
----
-
-# 10. Order Endpoint
-
-Orders are created using:
-
-```text
-POST http://localhost:8080/orders
-```
-
-When Payment is available:
-
-```text
-Order created: Payment successful
-```
-
-When Payment is unavailable, the current implementation throws an exception.
-
-This is intentional.
-
-We are first observing the failure without any protection.
-
----
-
-# 11. Current Failure Behaviour
-
-With Payment available:
-
-```text
-POST /orders
-       |
-       v
-Order Service
-       |
-       v
-Payment Service
-       |
-       v
-SUCCESS
-```
-
-After making Payment unavailable:
-
-```text
-POST /orders
-       |
-       v
-Order Service
-       |
-       v
-Payment Service
-       |
-       X
-    FAILURE
-```
-
-Calling `/orders` repeatedly continues to call the unhealthy Payment Service.
-
-There is currently nothing that says:
-
-> "Payment has failed repeatedly. Stop calling it."
-
-That is the problem our next implementation will solve.
-
----
-
-# 12. What We Have Learned So Far
-
-The important mental model is:
-
-> The Circuit Breaker is primarily a **protection mechanism for the caller and the overall system**, not a mechanism for fixing the failing dependency.
-
-If Payment is unhealthy:
-
-```text
-Payment Service
-      X
-      |
-      v
-Circuit Breaker
-      |
-      v
-Protect Order Service
-```
-
-The Circuit Breaker does not repair Payment.
-
-It limits the impact of Payment's failure.
-
----
-
-# 13. Next Step
-
-The next implementation will introduce our own `CircuitBreaker` class.
-
-Initial configuration:
-
-```text
-Failure threshold: 3 failures
-Open duration:     10 seconds
-```
-
-Expected lifecycle:
+The basic behavior was:
 
 ```text
 CLOSED
-   |
-   | 3 failures
-   v
+  |
+  | 3 failures
+  v
 OPEN
-   |
-   | wait 10 seconds
-   v
-HALF-OPEN
-   |
-   | test request
-   |
-   +---- success ----> CLOSED
-   |
-   +---- failure ----> OPEN
+  |
+  | 10 seconds
+  v
+HALF_OPEN
 ```
 
-We will then deliberately test:
+A successful HALF_OPEN probe returned the circuit to CLOSED.
 
-1. Three failed requests
-2. Circuit opening
-3. A fourth request being rejected immediately
-4. Waiting for the open duration
-5. Transitioning to HALF-OPEN
-6. Successful recovery
-7. Returning to CLOSED
+A failed HALF_OPEN probe returned it to OPEN.
 
-After that, we will deliberately identify weaknesses in our first implementation and improve it toward production-grade behaviour.
+## Experiment
+
+Payment was made unavailable and three order requests were sent.
+
+The breaker transitioned:
+
+```text
+CLOSED → OPEN
+```
+
+Further requests were rejected without calling Payment Service.
+
+After the 10-second open duration:
+
+```text
+OPEN → HALF_OPEN
+```
+
+The next request became the recovery probe.
 
 ---
 
-## Learning Philosophy
+# 8. Version 1 Problem — HALF_OPEN Concurrency
 
-This lab intentionally follows:
+The initial implementation contained:
 
-```text
-Understand the problem
-        |
-        v
-Build the simplest solution
-        |
-        v
-Observe the solution
-        |
-        v
-Break the solution
-        |
-        v
-Understand its limitations
-        |
-        v
-Improve it
-        |
-        v
-Compare with production libraries
+```java
+// HALF_OPEN
+return true;
 ```
 
-The goal is understanding the underlying distributed-systems concepts rather than memorizing framework annotations.
+This meant every request was allowed while the circuit was HALF_OPEN.
+
+Twenty concurrent requests were sent.
+
+The result was effectively:
+
+```text
+20 requests
+    |
+    +----> Payment Service
+    +----> Payment Service
+    +----> Payment Service
+    ...
+```
+
+All 20 requests were allowed through.
+
+This violated an important Circuit Breaker invariant:
+
+> At most one recovery probe should be in flight during HALF_OPEN.
+
+The experiment demonstrated why a correct state machine is not enough. Concurrency must also be considered.
+
+---
+
+# 9. Version 2 — Thread-Safe HALF_OPEN Probe
+
+V2 introduced:
+
+```java
+private boolean halfOpenProbeInProgress = false;
+```
+
+and synchronized access to the state transition:
+
+```java
+public synchronized boolean allowRequest()
+```
+
+The HALF_OPEN behavior became:
+
+```text
+HALF_OPEN
+    |
+    +---- first request → claim probe → ALLOW
+    |
+    +---- other requests → REJECT
+```
+
+The key invariant became:
+
+> Only one request may claim the HALF_OPEN probe.
+
+## Why Synchronization Was Necessary
+
+Without synchronization, this could race:
+
+```java
+if (!halfOpenProbeInProgress) {
+    halfOpenProbeInProgress = true;
+    return true;
+}
+```
+
+Two threads could both observe `false` before either updated it.
+
+With synchronization, one thread claims the probe first and later threads observe that the probe is already in progress.
+
+---
+
+# 10. Version 2 Experiment
+
+The experiment used:
+
+- 3-second payment delay
+- 20 concurrent requests
+- Payment service recovered before the test
+
+The behavior changed from:
+
+```text
+20 successful payment calls
+```
+
+to approximately:
+
+```text
+1 successful probe
+19 rejected requests
+```
+
+Application logs showed:
+
+```text
+[CircuitBreaker] CLOSED -> OPEN
+[CircuitBreaker] OPEN -> HALF_OPEN
+[CircuitBreaker] HALF_OPEN probe CLAIMED
+[CircuitBreaker] HALF_OPEN -> CLOSED
+```
+
+This demonstrated that the HALF_OPEN probe was controlled.
+
+---
+
+# 11. HALF_OPEN Failure Experiment
+
+Payment was intentionally kept unavailable after the breaker entered HALF_OPEN.
+
+The observed transition was:
+
+```text
+[CircuitBreaker] OPEN -> HALF_OPEN
+[CircuitBreaker] HALF_OPEN -> OPEN
+```
+
+This was repeated when another recovery period elapsed.
+
+The resulting behavior was:
+
+```text
+OPEN
+  |
+  | wait
+  v
+HALF_OPEN
+  |
+  | probe fails
+  v
+OPEN
+```
+
+This verified both HALF_OPEN outcomes:
+
+```text
+                    HALF_OPEN
+                   /          \
+              success        failure
+                 |              |
+                 v              v
+              CLOSED           OPEN
+```
+
+---
+
+# 12. Version 2 Lessons
+
+### State transitions must be concurrency-safe
+
+The Circuit Breaker is a shared state machine.
+
+Fields such as:
+
+```text
+state
+failureCount
+openedAt
+halfOpenProbeInProgress
+```
+
+cannot be treated as independent ordinary variables when multiple threads access them.
+
+### Do not hold the lock during the dependency call
+
+We should not do:
+
+```text
+lock
+  |
+  v
+Payment Service
+  |
+  | 3 seconds
+  v
+unlock
+```
+
+That would unnecessarily serialize requests.
+
+Instead:
+
+```text
+lock
+  |
+  | claim probe
+  v
+unlock
+  |
+  v
+Payment Service
+  |
+  v
+lock
+  |
+  | record result
+  v
+unlock
+```
+
+The critical section protects state transitions, not the remote operation itself.
+
+---
+
+# 13. Version 3 — Failure-Rate-Based Circuit Breaker
+
+The V1/V2 breaker opened after:
+
+```text
+3 consecutive failures
+```
+
+That is useful for learning but simplistic.
+
+V3 introduces a simple sliding window.
+
+Configuration:
+
+```text
+Window size = 10 calls
+Failure rate threshold = 50%
+Open duration = 10 seconds
+```
+
+The breaker evaluates the failure rate once the window contains enough calls.
+
+Example:
+
+```text
+10 recent calls
+
+Success = 4
+Failure = 6
+
+Failure rate = 60%
+
+60% >= 50%
+       |
+       v
+      OPEN
+```
+
+Whereas:
+
+```text
+10 recent calls
+
+Success = 7
+Failure = 3
+
+Failure rate = 30%
+
+30% < 50%
+       |
+       v
+     CLOSED
+```
+
+---
+
+# 14. Sliding Window
+
+The implementation uses:
+
+```java
+Deque<Boolean> results
+```
+
+Each result represents:
+
+```text
+true  → success
+false → failure
+```
+
+When the window is full:
+
+```java
+results.removeFirst();
+```
+
+removes the oldest result.
+
+Then:
+
+```java
+results.addLast(success);
+```
+
+adds the newest result.
+
+Therefore the breaker always evaluates the most recent calls.
+
+This is the basic idea of a sliding window.
+
+---
+
+# 15. Minimum Number of Calls
+
+V3 does not evaluate the failure rate immediately.
+
+It waits until:
+
+```text
+results.size() >= windowSize
+```
+
+This prevents a tiny sample from immediately opening the circuit.
+
+Without this rule:
+
+```text
+1 call
+1 failure
+100% failure rate
+```
+
+could immediately open the circuit.
+
+Instead, the breaker waits until enough observations have been collected.
+
+---
+
+# 16. Version 3 HALF_OPEN Behavior
+
+V3 retains the controlled HALF_OPEN probe from V2.
+
+When OPEN duration expires:
+
+```text
+OPEN
+  |
+  | wait 10 seconds
+  v
+HALF_OPEN
+```
+
+Only one request can claim the probe:
+
+```text
+HALF_OPEN
+    |
+    +---- Request A → PROBE
+    |
+    +---- Request B → REJECT
+    |
+    +---- Request C → REJECT
+    |
+    +---- ...
+```
+
+### Probe succeeds
+
+```text
+HALF_OPEN → CLOSED
+```
+
+The previous results are cleared because the dependency has demonstrated recovery.
+
+### Probe fails
+
+```text
+HALF_OPEN → OPEN
+```
+
+The dependency is still unhealthy, so the circuit remains open.
+
+---
+
+# 17. Version 3 Architecture
+
+The lab keeps separate service implementations so the learning history is preserved:
+
+```text
+OrderService
+    |
+    └── CircuitBreaker
+         └── V1
+
+OrderServiceV2
+    |
+    └── CircuitBreakerV2
+         └── V2
+
+OrderServiceV3
+    |
+    └── CircuitBreakerV3
+         └── V3
+```
+
+The versions represent the evolution of the design.
+
+---
+
+# 18. Key Invariants Learned
+
+## Invariant 1 — OPEN must fail fast
+
+When the circuit is OPEN, the dependency should not be called.
+
+## Invariant 2 — HALF_OPEN must be controlled
+
+Only a limited number of requests should test recovery.
+
+For this implementation:
+
+```text
+At most one probe in flight.
+```
+
+## Invariant 3 — HALF_OPEN failure must reopen the circuit
+
+```text
+HALF_OPEN + failed probe
+        ↓
+      OPEN
+```
+
+## Invariant 4 — HALF_OPEN success closes the circuit
+
+```text
+HALF_OPEN + successful probe
+        ↓
+      CLOSED
+```
+
+## Invariant 5 — State transitions must be thread-safe
+
+The breaker is shared state accessed by concurrent requests.
+
+## Invariant 6 — Don't hold synchronization around slow dependency calls
+
+Protect the state transition, not the remote operation.
+
+---
+
+# 19. Why We Built This Before Using Resilience4j
+
+A framework can make Circuit Breakers easy to configure:
+
+```java
+@CircuitBreaker(...)
+```
+
+But using an annotation without understanding the underlying behavior makes it easy to miss important system-design questions.
+
+By building the breaker ourselves, we encountered:
+
+- state machines
+- concurrency
+- race conditions
+- synchronization
+- failure thresholds
+- failure-rate windows
+- recovery probes
+- fail-fast behavior
+- state-transition correctness
+- observability considerations
+
+These concepts remain relevant even when a production library handles the implementation details.
+
+---
+
+# 20. What Our Implementation Still Does Not Handle
+
+This implementation is intentionally educational rather than production-ready.
+
+### Failure classification
+
+Currently an exception is treated as a dependency failure.
+
+A real system should distinguish between:
+
+```text
+Dependency failure
+Timeout
+Connection failure
+Application bug
+Validation error
+Business rejection
+```
+
+Not every exception should necessarily trip the circuit.
+
+### Slow calls
+
+A dependency may respond successfully but take too long.
+
+Production Circuit Breakers can consider slow calls as a separate failure signal.
+
+### Metrics
+
+A production implementation needs visibility into:
+
+```text
+Circuit state
+Failure rate
+Rejected calls
+Successful calls
+Failed calls
+Slow calls
+HALF_OPEN probes
+```
+
+### Distributed instances
+
+Our Circuit Breaker is local to one application instance.
+
+With multiple Order Service instances:
+
+```text
+             Load Balancer
+              /    |    \
+             /     |     \
+            v      v      v
+          App 1  App 2  App 3
+            |      |      |
+           CB     CB     CB
+            \      |      /
+             \     |     /
+              Payment
+```
+
+Each instance can have its own breaker state.
+
+This is an important architectural consideration.
+
+### Real network failure
+
+Our Payment Service currently lives in the same Spring Boot application.
+
+A future experiment can separate it into an actual service so we can observe:
+
+- connection failures
+- HTTP timeouts
+- network latency
+- connection pool exhaustion
+- retries interacting with the breaker
+
+---
+
+# 21. Current Status
+
+## Circuit Breaker Lab
+
+- [x] Understand why Circuit Breakers exist
+- [x] Understand CLOSED
+- [x] Understand OPEN
+- [x] Understand HALF_OPEN
+- [x] Implement V1
+- [x] Test fail-fast behavior
+- [x] Test recovery
+- [x] Break HALF_OPEN with concurrent requests
+- [x] Implement controlled HALF_OPEN probe
+- [x] Make state operations thread-safe
+- [x] Test successful HALF_OPEN recovery
+- [x] Test failed HALF_OPEN recovery
+- [x] Implement failure-rate-based opening
+- [x] Implement a sliding window
+- [x] Understand minimum-call requirements
+- [ ] Explore slow-call thresholds
+- [ ] Introduce a real remote Payment Service
+- [ ] Study production Circuit Breaker implementations
+- [ ] Implement Circuit Breaker with Resilience4j
+- [ ] Combine Timeout + Retry + Circuit Breaker
+
+---
+
+# 22. Next Step
+
+The homemade implementation has now served its purpose.
+
+The next stage is to study a production implementation such as **Resilience4j**.
+
+The goal is not simply:
+
+> "How do I add `@CircuitBreaker`?"
+
+Instead:
+
+```text
+Our implementation
+        ↓
+What problems did we solve?
+        ↓
+What problems did we ignore?
+        ↓
+How does Resilience4j solve them?
+        ↓
+How should Circuit Breaker interact with
+Timeout + Retry + Idempotency?
+```
+
+This bridges the gap between the theory implemented manually and patterns used in production Spring Boot systems.
+
+---
+
+# 23. Final Takeaway
+
+The most important mental model from this lab is:
+
+> A Circuit Breaker is a state machine that protects a caller from repeatedly interacting with an unhealthy dependency.
+
+It does not repair the dependency.
+
+It does not replace timeouts.
+
+It does not automatically make retries safe.
+
+It does not eliminate failures.
+
+It controls **when the caller is willing to attempt the dependency again**.
+
+The essential flow is:
+
+```text
+             Healthy
+               |
+               v
+            CLOSED
+               |
+       repeated failures
+               |
+               v
+             OPEN
+               |
+          wait period
+               |
+               v
+          HALF_OPEN
+           /       \
+      success      failure
+         |            |
+         v            v
+      CLOSED         OPEN
+```
+
+And under concurrency:
+
+```text
+HALF_OPEN
+    |
+    +-- one controlled probe
+    |
+    +-- competing requests fail fast
+```
+
+That is the core Circuit Breaker pattern.
