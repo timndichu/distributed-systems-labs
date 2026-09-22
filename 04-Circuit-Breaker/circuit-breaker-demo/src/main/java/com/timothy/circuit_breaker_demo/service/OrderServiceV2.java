@@ -5,14 +5,14 @@ import java.time.Duration;
 import org.springframework.stereotype.Service;
 
 @Service
-public class OrderService {
+public class OrderServiceV2 {
 
     private final PaymentService paymentService;
 
-    private final CircuitBreakerV1 circuitBreaker =
-            new CircuitBreakerV1(3, Duration.ofSeconds(10));
+    private final CircuitBreakerV2 circuitBreaker =
+            new CircuitBreakerV2(3, Duration.ofSeconds(10));
 
-    public OrderService(PaymentService paymentService) {
+    public OrderServiceV2(PaymentService paymentService) {
         this.paymentService = paymentService;
     }
 

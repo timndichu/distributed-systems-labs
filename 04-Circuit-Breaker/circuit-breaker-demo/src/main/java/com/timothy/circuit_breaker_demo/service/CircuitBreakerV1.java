@@ -3,7 +3,7 @@ package com.timothy.circuit_breaker_demo.service;
 import java.time.Duration;
 import java.time.Instant;
 
-public class CircuitBreaker {
+public class CircuitBreakerV1 {
 
     public enum State {
         CLOSED,
@@ -20,7 +20,7 @@ public class CircuitBreaker {
 
     private Instant openedAt;
 
-    public CircuitBreaker(int failureThreshold, Duration openDuration) {
+    public CircuitBreakerV1(int failureThreshold, Duration openDuration) {
         this.failureThreshold = failureThreshold;
         this.openDuration = openDuration;
     }

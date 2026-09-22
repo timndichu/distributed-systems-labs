@@ -13,6 +13,12 @@ public class PaymentService {
             throw new RuntimeException("Payment service is unavailable");
         }
 
+        try {
+            Thread.sleep(3000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
         return "Payment successful";
     }
 
