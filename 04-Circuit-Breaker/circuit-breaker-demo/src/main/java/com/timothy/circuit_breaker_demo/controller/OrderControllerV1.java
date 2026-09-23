@@ -1,6 +1,6 @@
 package com.timothy.circuit_breaker_demo.controller;
 
-import com.timothy.circuit_breaker_demo.service.OrderService;
+import com.timothy.circuit_breaker_demo.service.OrderServiceV1;
 
 import org.springframework.web.bind.annotation.*;
 
@@ -8,9 +8,9 @@ import org.springframework.web.bind.annotation.*;
 @RequestMapping("/orders/v1")
 public class OrderControllerV1 {
 
-    private final OrderService orderService;
+    private final OrderServiceV1 orderService;
 
-    public OrderControllerV1(OrderService orderService) {
+    public OrderControllerV1(OrderServiceV1 orderService) {
         this.orderService = orderService;
     }
 
