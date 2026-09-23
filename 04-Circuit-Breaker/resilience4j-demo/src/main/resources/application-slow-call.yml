@@ -3,7 +3,7 @@ spring:
     name: resilience4j-demo
 
 payment:
-  delay: 0
+  delay: 3000
 
 resilience4j:
   circuitbreaker:
@@ -14,6 +14,8 @@ resilience4j:
         failureRateThreshold: 50
         waitDurationInOpenState: 10s
         permittedNumberOfCallsInHalfOpenState: 1
+        slowCallDurationThreshold: 2s
+        slowCallRateThreshold: 50
 
 logging:
   level:
