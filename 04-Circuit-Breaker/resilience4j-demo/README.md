@@ -866,7 +866,7 @@ The next lab will deliberately slow down `PaymentService` and observe the Circui
 
 The slow-call experiment is documented separately:
 
-👉 [Slow-Call Detection Lab](./Slow-Call-Detection.md)
+👉 [Slow-Call Detection Lab](./slow-call/Slow-Call-Detection.md)
 
 ---
 
