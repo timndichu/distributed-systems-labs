@@ -864,6 +864,10 @@ Stop sending traffic when the dependency becomes unhealthy
 
 The next lab will deliberately slow down `PaymentService` and observe the Circuit Breaker reacting to slow calls.
 
+The slow-call experiment is documented separately:
+
+👉 [Slow-Call Detection Lab](./Slow-Call-Detection.md)
+
 ---
 
 ## Final Takeaway
