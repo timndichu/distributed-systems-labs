@@ -382,10 +382,8 @@ The two implementations are intentionally kept separate so that the homemade exp
 # 7. Lab 1 — Homemade Circuit Breaker
 
 Location:
-
-```text
 [circuit-breaker-demo/](./circuit-breaker-demo/)
-```
+
 
 This project starts without a Circuit Breaker and gradually builds one from scratch.
 
@@ -652,10 +650,8 @@ The purpose is to answer:
 # 13. Lab 2 — Resilience4j
 
 Location:
-
-```text
 [resilience4j-demo/](./resilience4j-demo/)
-```
+
 
 After understanding the pattern ourselves, the lab moves to a production-oriented implementation using Resilience4j.
 
