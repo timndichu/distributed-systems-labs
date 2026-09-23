@@ -384,7 +384,7 @@ The two implementations are intentionally kept separate so that the homemade exp
 Location:
 
 ```text
-circuit-breaker-demo/
+[circuit-breaker-demo/](./circuit-breaker-demo/)
 ```
 
 This project starts without a Circuit Breaker and gradually builds one from scratch.
@@ -654,7 +654,7 @@ The purpose is to answer:
 Location:
 
 ```text
-resilience4j-demo/
+[resilience4j-demo/](./resilience4j-demo/)
 ```
 
 After understanding the pattern ourselves, the lab moves to a production-oriented implementation using Resilience4j.
