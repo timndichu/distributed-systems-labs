@@ -286,8 +286,8 @@ logging:
 
 ### Configuration mapping
 
-| Resilience4j setting | Meaning |
-|---|---|
+| Resilience4j setting    | Meaning |
+|-------------------------|--------------------------------------------------------|
 | `slidingWindowSize: 10` | Evaluate the most recent 10 calls |
 | `minimumNumberOfCalls: 10` | Don't evaluate failure rate until at least 10 calls are recorded |
 | `failureRateThreshold: 50` | Open when failure rate reaches 50% |
