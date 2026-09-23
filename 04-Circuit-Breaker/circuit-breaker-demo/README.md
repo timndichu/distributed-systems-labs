@@ -1,4 +1,4 @@
-# Circuit Breaker Lab — Version 3
+# Circuit Breaker Lab
 
 ## Overview
 
