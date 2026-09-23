@@ -1,10 +1,3 @@
-Yes — now that **Circuit Breaker is much further along**, the root `distributed-systems-labs` README should reflect the repository as a whole rather than treating Circuit Breaker as just an in-progress placeholder.
-
-I’d also slightly change the tone: make it feel more like an engineering lab repository and less like a course checklist.
-
-Here’s the reworked version I recommend:
-
-````markdown
 # Distributed Systems Labs
 
 A collection of hands-on experiments for understanding how distributed systems behave under **latency, failures, concurrency, retries, partial failure, and ambiguous outcomes**.
@@ -563,10 +556,3 @@ Each experiment is intentionally small, but the problems being explored are the 
 The objective is not to memorize patterns.
 
 It is to develop the ability to reason about what happens when a distributed system does **not** behave as expected.
-"""
-
-path = Path("/mnt/data/distributed-systems-labs-README.md")
-path.write_text(content, encoding="utf-8")
-print(path)
-print(f"{len(content.splitlines())} lines")
-print(f"{len(content.split())} words")
