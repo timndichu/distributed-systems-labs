@@ -1,0 +1,29 @@
+spring:
+  application:
+    name: resilience4j-demo
+
+payment:
+  delay: 5000
+
+resilience4j:
+  bulkhead:
+    instances:
+      payment:
+        maxConcurrentCalls: 2
+        maxWaitDuration: 0
+
+# resilience4j:
+#   circuitbreaker:
+#     instances:
+#       paymentService:
+#         slidingWindowSize: 10
+#         minimumNumberOfCalls: 10
+#         failureRateThreshold: 50
+#         waitDurationInOpenState: 10s
+#         permittedNumberOfCallsInHalfOpenState: 1
+#         slowCallDurationThreshold: 2s
+#         slowCallRateThreshold: 50
+
+logging:
+  level:
+    io.github.resilience4j.circuitbreaker: DEBUG
